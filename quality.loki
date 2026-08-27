@@ -2,181 +2,269 @@
 # MadBomber-level quality-gate tasks. Universal across all projects.
 # Import from a project-level loki (e.g. `import "../dev/quality.loki"`), which
 # component .loki files then reach via `import_up "repo_dev.loki"`.
+#
+# Mirrors asgard's own quality.loki (the golden pattern): every `quality`
+# gate is a `*_check` task; `quality` discovers them dynamically at runtime
+# rather than a fixed list, so a `*_check` task from elsewhere (e.g.
+# quality_rails.loki's brakeman_check, loaded automatically once Rails is
+# defined, or a component's own archspec_check) is picked up too, with no
+# need to redeclare or extend anything.
 
 class Tasks
   desc "Run the test suite"
-  def test
-    sh "bundle exec rake test"
+  def test_check
+    output = `bundle exec rake test 2>&1`
+    result = $?.success? ? :pass : :fail
+    File.write("test_output.txt", output)
+    summary = output.lines.reverse.find { |l| l =~ /\d+ runs,/ }&.strip || result.to_s
+    puts "Tests: #{summary} (see test_output.txt)"
+    result
   end
 
-  desc "Run tests with verbose output"
+  desc "Run the test suite with verbose output"
   def test_verbose
     sh "bundle exec rake test_verbose"
   end
 
-  desc "Check code style with RuboCop"
-  def rubocop
-    sh "bundle exec rubocop"
-  end
-
-  desc "Auto-correct RuboCop offenses"
-  def rubocop_fix
-    sh "bundle exec rubocop -a"
-  end
-
-  desc "Check code complexity with Flog (warn >=20, fail >=50)"
-  def flog
-    sh "bundle exec rake flog_check"
-  end
-
-  desc "Check for structural code duplication with Flay (mass >= 150)"
-  def flay
-    sh "bundle exec rake flay_check"
-  end
-
-  desc "Check code smells with Reek (fails only on new or worsened files)"
-  def reek
-    current  = reek_scan
-    baseline = load_reek_baseline
-
-    new_files = current.reject { |f, _| baseline.key?(f) }
-    worsened  = current.select { |f, c| baseline.key?(f) && c > baseline[f] }
-    improved  = baseline.count { |f, c| current.key?(f) && current[f] < c }
-    cleaned   = baseline.keys - current.keys
-
-    total_current  = current.values.sum
-    total_baseline = baseline.values.sum
-
-    puts "\nReek: #{total_current} warning(s) across #{current.size} file(s) " \
-         "(#{total_baseline} grandfathered across #{baseline.size} file(s))."
-    puts "  #{cleaned.size} file(s) fully clean — run `asgard reek_baseline` to prune." unless cleaned.empty?
-    puts "  #{improved} file(s) improved — run `asgard reek_baseline` to ratchet down." unless improved.zero?
-
-    problems = new_files.map { |f, c| format("NEW      %3d warning(s): %s", c, f) } +
-               worsened.map  { |f, c| format("WORSENED %3d -> %3d: %s", baseline[f], c, f) }
-
-    if problems.empty?
-      puts "Reek quality gate passed (no new or worsened files)."
-    else
-      puts "\nReek quality gate FAILED:"
-      problems.each { |p| puts "  #{p}" }
-      abort "\nReek: #{problems.size} file(s) regressed. Fix smells, or `asgard reek_baseline` if intentional."
-    end
-  end
-
-  desc "Regenerate the Reek baseline (grandfathers current smell counts per file)"
-  def reek_baseline
-    require "fileutils"
-    FileUtils.mkdir_p(".quality")
-    warnings = reek_scan
-    body = warnings.sort_by { |f, _| f }.map { |f, c| "#{c}\t#{f}" }.join("\n")
-    File.write(".quality/reek_baseline.txt", body.empty? ? "" : "#{body}\n")
-    puts "Wrote #{warnings.size} file(s) with smells to .quality/reek_baseline.txt"
-  end
-
-  desc "Run all quality gates: tests + RuboCop + Flog + Flay + Reek"
+  desc "Run every *_check quality gate task in parallel"
+  # A Proc defers resolution to validate_deps!, after every .loki file has
+  # loaded — so a *_check task from another file is picked up too, with no
+  # need to redeclare anything here.
+  depends_on -> { [all_commands.keys.grep(/_check\z/).sort.map(&:to_sym)] }
   def quality
-    gates = [
-      ["Tests + Coverage", "bundle exec rake test"],
-      ["RuboCop",          "bundle exec rubocop"],
-      ["Flog Complexity",  "bundle exec rake flog_check"],
-      ["Flay Duplication", "bundle exec rake flay_check"],
-      ["Reek Smells",      -> { reek_gate }]
-    ]
+    check_tasks = self.class._deps.fetch(:quality, []).flatten.map(&:to_s)
 
-    results = gates.map do |label, command|
-      puts "\n#{"=" * 60}"
-      puts "Quality Gate: #{label}"
-      puts "=" * 60
-      ok = command.respond_to?(:call) ? command.call : system(command)
-      [label, ok ? :pass : :fail]
-    end
+    results = check_tasks.to_h { |name| [quality_gate_label(name), dep_result(name)] }
 
     print_quality_summary(results)
   end
 
+  desc "Check code style with RuboCop"
+  def rubocop_check
+    output = `RUBOCOP_CACHE_ROOT=tmp/rubocop_cache bundle exec rubocop 2>&1`
+    result = $?.success? ? :pass : :fail
+    File.write("rubocop_output.txt", output)
+    summary = output.lines.find { |l| l =~ /files inspected/ }&.strip || result.to_s
+    puts "RuboCop: #{summary} (see rubocop_output.txt)"
+    result
+  end
+
+  desc "Auto-correct RuboCop offenses"
+  def rubocop_fix
+    sh "RUBOCOP_CACHE_ROOT=tmp/rubocop_cache bundle exec rubocop -a"
+  end
+
+  desc "Check code complexity with Flog (warn >=20, fail >=50)"
+  def flog_check
+    require "flog"
+
+    method_warn = 20.0
+    method_fail = 50.0
+
+    flogger = Flog.new(all: true)
+    flogger.flog(*Dir.glob("lib/**/*.rb"))
+
+    warnings = []
+    failures = []
+
+    flogger.each_by_score do |method_name, score|
+      next if method_name.end_with?("#none")
+      if score > method_fail
+        failures << "#{"%.1f" % score}: #{method_name}"
+      elsif score > method_warn
+        warnings << "#{"%.1f" % score}: #{method_name}"
+      end
+    end
+
+    result = failures.empty? ? :pass : :fail
+
+    lines = ["Flog warnings (#{method_warn}–#{method_fail}):"]
+    lines.concat(warnings.empty? ? ["  (none)"] : warnings.map { |w| "  #{w}" })
+    lines << ""
+    lines << "Flog failures (>= #{method_fail}):"
+    lines.concat(failures.empty? ? ["  (none)"] : failures.map { |f| "  #{f}" })
+    File.write("flog_output.txt", "#{lines.join("\n")}\n")
+
+    puts "Flog: #{failures.size} failure(s), #{warnings.size} warning(s) (see flog_output.txt)"
+    result
+  end
+
+  desc "Check for structural code duplication with Flay (mass >= 150)"
+  def flay_check
+    require "flay"
+
+    mass_threshold = 150
+
+    flay = Flay.new(mass: mass_threshold, diff: false, verbose: false, summary: false, timeout: 60)
+    flay.process(*Dir.glob("lib/**/*.rb"))
+    flay.analyze
+
+    result = flay.hashes.empty? ? :pass : :fail
+
+    File.open("flay_output.txt", "w") do |f|
+      if result == :pass
+        f.puts "Flay: no structural duplication detected (mass >= #{mass_threshold})"
+      else
+        flay.report(f)
+      end
+    end
+    puts "Flay: #{flay.hashes.size} duplication pattern(s) found (mass >= #{mass_threshold}) (see flay_output.txt)"
+    result
+  end
+
+  desc "Check code smells with Reek"
+  def reek_check
+    output = `bundle exec reek lib 2>&1`
+    result = $?.success? ? :pass : :fail
+    File.write("reek_output.txt", output)
+    summary = output.lines.reverse.find { |l| l =~ /total warnings?/ }&.strip || result.to_s
+    puts "Reek: #{summary} (see reek_output.txt)"
+    result
+  end
+
+  desc "Check spelling with typos"
+  def typos_check
+    return skip_typos unless command_available?("typos")
+
+    output = `typos 2>&1`
+    result = $?.success? ? :pass : :fail
+    File.write("typos_output.txt", output)
+    count   = output.lines.count { |l| l.start_with?("error:") }
+    summary = result == :pass ? "no typos found" : "#{count} typo(s) found"
+    puts "Typos: #{summary} (see typos_output.txt)"
+    result
+  end
+
+  desc "Auto-correct typos"
+  def typos_fix
+    return skip_typos unless command_available?("typos")
+
+    sh "typos -w"
+  end
+
+  desc "Check ERB templates for style and safety issues with ERBLint"
+  def erb_lint_check
+    return skip_erb_lint if Dir.glob("**/*.erb").empty?
+
+    output = `bundle exec erb_lint --lint-all --enable-all-linters 2>&1`
+    result = $?.success? ? :pass : :fail
+    File.write("erb_lint_output.txt", output)
+    summary = output.lines.reverse.find { |l| l =~ /error\(s\)|no errors were found/i }&.strip || result.to_s
+    puts "ERBLint: #{summary} (see erb_lint_output.txt)"
+    result
+  end
+
+  desc "Check for performance suggestions with Fasterer"
+  def fasterer_check
+    output = `bundle exec fasterer lib 2>&1`.gsub(/\e\[\d+m/, "")
+    result = $?.success? ? :pass : :warn
+    File.write("fasterer_output.txt", output)
+    summary = output.lines.find { |l| l =~ /files? inspected/ }&.strip || result.to_s
+    puts "Fasterer: #{summary} (see fasterer_output.txt)"
+    result
+  end
+
+  desc "Check Gemfile.lock for known vulnerabilities with bundler-audit"
+  def bundler_audit_check
+    output = `bundle exec bundle-audit check --update 2>&1`
+    result = $?.success? ? :pass : :fail
+    File.write("bundler_audit_output.txt", output)
+    summary = output.lines.reverse.find { |l| l =~ /vulnerabilit/i }&.strip || result.to_s
+    puts "Bundler Audit: #{summary} (see bundler_audit_output.txt)"
+    result
+  end
+
+  desc "Check architecture boundaries with ArchSpec"
+  def archspec_check
+    return skip_archspec unless command_available?("archspec") && File.exist?("Archspec.rb")
+
+    output = `archspec check 2>&1`
+    result = $?.success? ? :pass : :fail
+    File.write("archspec_output.txt", output)
+    summary = output.lines.reverse.find { |l| l =~ /architecture violations? found|ArchSpec passed/i }&.strip ||
+      result.to_s
+    puts "ArchSpec: #{summary} (see archspec_output.txt)"
+    result
+  end
+
+  # Curated display labels for the *_check tasks defined in this file. A
+  # *_check task from elsewhere (e.g. quality_rails.loki's brakeman_check,
+  # loaded automatically once Rails is defined) isn't listed here — it just
+  # falls back to a titleized version of its own name in quality_gate_label.
+  QUALITY_GATE_LABELS = {
+    "test_check"     => "Tests + Coverage",
+    "rubocop_check"  => "RuboCop",
+    "flog_check"     => "Flog Complexity",
+    "flay_check"     => "Flay Duplication",
+    "reek_check"     => "Reek Smells",
+    "erb_lint_check" => "ERBLint",
+    "archspec_check" => "ArchSpec",
+  }.freeze
+
   no_commands do
-    # Smell count per file (only files with >0 smells). The .reek.yml is
-    # resolved by walking up from the cwd (like import_up): a gem-level config
-    # wins, otherwise the shared project-level one is used — DRY by default,
-    # tailorable per gem.
-    def reek_scan
-      require "reek"
-      require "reek/configuration/app_configuration"
-      config_file = find_up(".reek.yml")
-      config = config_file ? Reek::Configuration::AppConfiguration.from_path(Pathname.new(config_file)) : nil
-      sources = Dir.glob("lib/**/*.rb") + Dir.glob("plugins/**/*.rb")
-      sources.each_with_object({}) do |f, acc|
-        count = Reek::Examiner.new(File.read(f), configuration: config).smells.size
-        acc[f] = count if count.positive?
+    # true if +name+ resolves to an executable file somewhere on PATH.
+    def command_available?(name)
+      ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).any? do |dir|
+        File.executable?(File.join(dir, name))
       end
     end
 
-    # Nearest ancestor (including cwd) containing +name+, or nil.
-    def find_up(name, from: Dir.pwd)
-      dir = Pathname.new(from).expand_path
-      loop do
-        candidate = dir.join(name)
-        return candidate.to_s if candidate.exist?
-        break if dir.root?
-
-        dir = dir.parent
-      end
-      nil
-    end
-
-    # Grandfathered smell counts from .quality/reek_baseline.txt ("count\tfile").
-    def load_reek_baseline
-      path = File.join(".quality", "reek_baseline.txt")
-      return {} unless File.exist?(path)
-
-      File.readlines(path).each_with_object({}) do |line, acc|
-        count, file = line.strip.split("\t", 2)
-        acc[file] = count.to_i if file && !file.empty?
+    def quality_gate_label(check_name)
+      QUALITY_GATE_LABELS.fetch(check_name) do
+        check_name.delete_suffix("_check").split("_").map(&:capitalize).join(" ")
       end
     end
 
-    # Non-aborting gate for the quality summary: true when no new/worsened files.
-    def reek_gate
-      current  = reek_scan
-      baseline = load_reek_baseline
-      new_files = current.reject { |f, _| baseline.key?(f) }
-      worsened  = current.select { |f, c| baseline.key?(f) && c > baseline[f] }
-      (new_files.empty? && worsened.empty?).tap do |ok|
-        report = ok ? "Reek quality gate passed.\n" : reek_failure_report(new_files, worsened, baseline)
-        File.write("reek_output.txt", report)
-      end
+    def skip_typos
+      puts "Typos: SKIPPED — `typos` command not found. Install it with `brew install typos-cli`."
+      :skip
     end
 
-    def reek_failure_report(new_files, worsened, baseline)
-      lines  = ["Reek quality gate FAILED:\n"]
-      lines += new_files.map { |f, c| format("  NEW      %3d warning(s): %s\n", c, f) }
-      lines += worsened.map  { |f, c| format("  WORSENED %3d -> %3d: %s\n", baseline[f], c, f) }
-      lines.join
+    def skip_erb_lint
+      puts "ERBLint: SKIPPED — no .erb files found."
+      :skip
     end
 
+    def skip_archspec
+      reason = command_available?("archspec") ? "no Archspec.rb found" : "`archspec` command not found"
+      puts "ArchSpec: SKIPPED — #{reason}. Install it with `gem install archspec` " \
+        "and run `archspec init` to generate one."
+      :skip
+    end
+
+    # Status badges. Only :fail is blocking (aborts the quality task);
+    # :skip (a required tool isn't installed) and :warn (the check ran but
+    # has non-blocking suggestions, e.g. a performance-hint gate) are not.
+    STATUS_BADGES = {
+      pass: ["PASS", 32], # green
+      fail: ["FAIL", 31], # red
+      warn: ["WARN", 33], # yellow
+      skip: ["SKIP", 36], # cyan
+    }.freeze
+
+    # Colorized status badges plus a pass/fail/warn/skip tally; aborts only
+    # if any gate failed — skip and warn are informational, not blocking.
     def print_quality_summary(results)
-      green = ->(s) { "\e[32m#{s}\e[0m" }
-      red   = ->(s) { "\e[31m#{s}\e[0m" }
-      width = results.map { |label, _| label.length }.max
+      colorize_badge = ->(code, text) { "\e[#{code}m#{text}\e[0m" }
+      width = results.keys.map(&:length).max
 
       puts "\n#{"=" * 60}"
       puts "Quality Gate Summary"
       puts "=" * 60
       results.each do |label, status|
-        badge = status == :pass ? green.call("PASS") : red.call("FAIL")
-        puts "  [#{badge}] #{label.ljust(width)}"
+        text, code = STATUS_BADGES.fetch(status)
+        puts "  [#{colorize_badge.call(code, text)}] #{label.ljust(width)}"
       end
       puts "-" * 60
 
-      passed = results.count { |_, s| s == :pass }
-      failed = results.count { |_, s| s == :fail }
-      tally  = "#{passed} passed, #{failed} failed"
-      puts "  #{failed.zero? ? green.call(tally) : red.call(tally)}"
+      counts = results.values.tally
+      failed = counts[:fail] || 0
+      tally  = STATUS_BADGES.keys.filter_map { |s| "#{counts[s]} #{s}" if counts[s]&.positive? }.join(", ")
+      puts "  #{colorize_badge.call(failed.zero? ? 32 : 31, tally)}"
       puts "=" * 60
 
-      abort "\n#{red.call("Quality gate failed.")}" unless failed.zero?
-      puts "\n#{green.call("All quality gates passed.")}"
+      abort "\n#{colorize_badge.call(31, "Quality gate failed.")}" unless failed.zero?
+      puts "\n#{colorize_badge.call(32, "All quality gates passed.")}"
     end
   end
 end

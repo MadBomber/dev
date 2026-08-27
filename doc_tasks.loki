@@ -1,0 +1,16 @@
+# dev/doc_tasks.loki
+
+# TODO: create common tasks for documentation management
+class Tasks
+
+  desc "Update README table of contents"
+  def toc_in_readmen = sh "rake toc"
+
+  desc "Documentation builder"
+  def doc_builder = puts "TODO: mkdocs build"
+
+  desc "Documentation server startup"
+  depends_on :doc_builder
+  def doc_server = puts "TODO: mkdocs serve"
+
+end

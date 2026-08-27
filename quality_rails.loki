@@ -1,0 +1,52 @@
+# frozen_string_literal: true
+# MadBomber-level Rails-specific quality gate tasks. Universal across all
+# projects. Import from a project-level loki (e.g.
+# `import_up "dev/quality_rails.loki" if ENV["RAILS_ROOT"]`), mirroring
+# asgard's own quality_rails.loki. Gated on RAILS_ROOT rather than
+# `defined?(Rails)`: asgard runs as a separate process outside the app it's
+# checking, so the app's Rails constant is never loaded into asgard's own
+# process. RAILS_ROOT is set in a Rails repo's own .envrc
+# (`export RAILS_ROOT=$RR`, after RR is defined) as the signal instead.
+#
+# `quality` (in quality.loki) discovers every *_check task at run time by
+# introspecting Tasks.all_commands, rather than a fixed depends_on list — so
+# any *_check task defined here is automatically picked up by `asgard
+# quality` too, with no need to redeclare or extend anything.
+#
+# Note on rubocop-rails: it's a RuboCop plugin, not a standalone CLI, so it
+# has no *_check task of its own here. Add the gem to the app's Gemfile and
+# `require: rubocop-rails` in its .rubocop.yml — the existing rubocop_check
+# (quality.loki) picks up the added Rails cops automatically.
+
+class Tasks
+  desc "Check for Rails security vulnerabilities with Brakeman"
+  def brakeman_check
+    output = `bundle exec brakeman -q 2>&1`
+    result = $?.success? ? :pass : :fail
+    File.write("brakeman_output.txt", output)
+    summary = output.lines.reverse.find { |l| l =~ /warnings? found/i }&.strip || result.to_s
+    puts "Brakeman: #{summary} (see brakeman_output.txt)"
+    result
+  end
+
+  desc "Check for Rails anti-patterns with RailsBestPractices"
+  def rails_best_practices_check
+    output = `bundle exec rails_best_practices --silent --without-color . 2>&1`
+    result = $?.success? ? :pass : :fail
+    File.write("rails_best_practices_output.txt", output)
+    summary = output.lines.reverse.find { |l| l =~ /warning/i }&.strip || result.to_s
+    puts "RailsBestPractices: #{summary} (see rails_best_practices_output.txt)"
+    result
+  end
+
+  desc "Check for database schema issues with ActiveRecordDoctor"
+  def active_record_doctor_check
+    output = `bundle exec rake active_record_doctor 2>&1`
+    result = $?.success? ? :pass : :fail
+    File.write("active_record_doctor_output.txt", output)
+    issue_count = output.lines.count { |l| l.strip != "" }
+    summary = result == :pass ? "no issues found" : "#{issue_count} issue line(s) found"
+    puts "ActiveRecordDoctor: #{summary} (see active_record_doctor_output.txt)"
+    result
+  end
+end

@@ -1,0 +1,11 @@
+# dev/iterm_tasks.loki
+
+class Tasks
+
+  desc "Fix half-duplex terminal"
+  def half_duplex_screen_fix = sh "stty sane"
+
+  desc "Clear the scroll-back buffer"
+  def clear_scroll_back_buffer = sh 'printf "\e[3J"'
+
+end
