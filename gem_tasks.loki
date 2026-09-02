@@ -3,11 +3,15 @@ require "fileutils"
 # MadBomber-level gem lifecycle tasks. Universal across all projects.
 # Import from a project-level loki (e.g. `import "../dev/gem_tasks.loki"`).
 #
-# @@gem_name defaults to the current directory's basename (the gem repo name);
-# a component/project may set it earlier if it differs.
+# @@gem_name defaults to the gemspec's basename (falling back to the current
+# directory's basename); a component/project may set it earlier if it differs.
 
 class Tasks
-  @@gem_name ||= File.basename(Dir.pwd).freeze
+  @@gem_name ||= if (gemspec = Dir.glob("*.gemspec").first)
+                   File.basename(gemspec, ".gemspec").freeze
+                 else
+                   File.basename(Dir.pwd).freeze
+                 end
 
   helper(:gem_version) do
     file = Dir.glob("lib/**/version.rb").first
@@ -56,6 +60,7 @@ class Tasks
     abort "Tag #{tag} already exists." unless `git tag -l "#{tag}"`.strip.empty?
 
     sh "git tag #{tag}"
+    sh "git push"
     sh "git push origin #{tag}"
     sh "gem push pkg/#{@@gem_name}-#{version}.gem"
     puts "\nReleased #{@@gem_name} v#{version}."
