@@ -146,7 +146,12 @@ class Tasks
   def erb_lint_check
     return skip_erb_lint if Dir.glob("**/*.erb").empty?
 
-    output = `bundle exec erb_lint --lint-all --enable-all-linters 2>&1`
+    # --enable-all-linters overrides a repo's own .erb_lint.yml, which defeats
+    # the point of a repo opting into its own linter selection (e.g. disabling
+    # HardCodedString in a single-locale app). Only force every linter on for
+    # repos that haven't made that choice for themselves.
+    flags = File.exist?(".erb_lint.yml") ? "--lint-all" : "--lint-all --enable-all-linters"
+    output = `bundle exec erb_lint #{flags} 2>&1`
     result = $?.success? ? :pass : :fail
     File.write("erb_lint_output.txt", output)
     summary = output.lines.reverse.find { |l| l =~ /error\(s\)|no errors were found/i }&.strip || result.to_s
@@ -166,7 +171,12 @@ class Tasks
 
   desc "Check Gemfile.lock for known vulnerabilities with bundler-audit"
   def bundler_audit_check
-    output = `bundle exec bundle-audit check --update 2>&1`
+    # Prefer the repo's own bin/bundler-audit when it has one -- some apps
+    # (e.g. ones that bundle via Gemfile.local instead of Gemfile) wrap the
+    # command with the --gemfile_lock/--config flags their convention needs.
+    # Falls back to the generic invocation otherwise.
+    command = File.exist?("bin/bundler-audit") ? "bin/bundler-audit" : "bundle exec bundle-audit check --update"
+    output = `#{command} 2>&1`
     result = $?.success? ? :pass : :fail
     File.write("bundler_audit_output.txt", output)
     summary = output.lines.reverse.find { |l| l =~ /vulnerabilit/i }&.strip || result.to_s

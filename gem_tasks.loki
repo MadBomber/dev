@@ -1,4 +1,5 @@
 # frozen_string_literal: true
+require "fileutils"
 # MadBomber-level gem lifecycle tasks. Universal across all projects.
 # Import from a project-level loki (e.g. `import "../dev/gem_tasks.loki"`).
 #
@@ -24,13 +25,17 @@ class Tasks
 
   desc "Build gem package"
   def build
-    sh "bundle exec rake build"
+    gemspec = Dir.glob("*.gemspec").first
+    abort "No gemspec found in #{Dir.pwd}." unless gemspec
+
+    FileUtils.mkdir_p("pkg")
+    sh "gem build #{gemspec} --output pkg/#{@@gem_name}-#{gem_version}.gem"
   end
 
   desc "Build and install gem locally"
   depends_on :build
   def install
-    sh "bundle exec rake install"
+    sh "gem install pkg/#{@@gem_name}-#{gem_version}.gem --local"
   end
 
   desc "release", "Release gem to RubyGems (runs quality gate first)"
