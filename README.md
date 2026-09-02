@@ -3,18 +3,31 @@
 This repo is the common layer of development tasks shared by the repos in the
 `~/sandbox/git_repos/madbomber/` workspace. It contains no application code —
 just `.loki` task files for [Asgard](https://github.com/madbomber/asgard)
-(a Thor-based task runner) plus a strict RuboCop overlay.
+(a Thor-based task runner) plus a strict RuboCop overlay. See the
+[Asgard documentation website](https://madbomber.github.io/asgard) for the
+full `.loki` file DSL and feature set.
 
-Individual project repos do not copy these tasks; they import them. A sibling
-repo's `.loki` (or an intermediate `repo_dev.loki` reached via `import_up`)
-pulls in whichever libraries apply:
+To use it, clone this repo as a peer-level directory to your projects — or
+anywhere higher up in their filesystem chain.  Here is how I
+have it setup:
+
+```
+~/sandbox/git_repos/madbomber/
+├── dev/            # this repo
+├── my_gem/         # my projects, as peers (or deeper below)
+└── my_rails_app/
+```
+
+Individual project repos do not copy these tasks; they import them with
+`import_up`, which searches from the project directory upward through its
+parents until it finds the named file — so no relative paths to maintain:
 
 ```ruby
-# a gem repo's .loki
-import "../dev/gem_tasks.loki"
-import "../dev/quality.loki"
-import "../dev/git.loki"
-import "../dev/quality_rails.loki" if ENV["RAILS_ROOT"]   # Rails apps only
+# a gem repo's .loki might look like this
+import_up "dev/gem_tasks.loki"
+import_up "dev/quality.loki"
+import_up "dev/git.loki"
+import_up "dev/quality_rails.loki" if ENV["RAILS_ROOT"]   # Rails apps only
 ```
 
 Because every `.loki` file simply reopens `class Tasks`, imported tasks merge
@@ -83,3 +96,16 @@ stay enabled no matter what `.rubocop_todo.yml` or inline directives say.
   repo's own `.loki`, which can override or extend what it imports.
 - `asgard/` in this workspace mirrors these files and is the golden pattern
   they follow.
+
+## Contributing
+
+Bug reports and pull requests are welcome at
+https://github.com/MadBomber/dev. Have a task or quality gate that would be
+useful across many Ruby projects? Open a PR — keep it universal (see
+Conventions above), and name any new gate `*_check` so the `quality` task
+picks it up automatically. Ideas and feedback are just as welcome as code;
+feel free to open an issue to start a discussion.
+
+## License
+
+Released under the [MIT License](LICENSE).
