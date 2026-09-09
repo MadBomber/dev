@@ -1,15 +1,20 @@
 # dev/doc_tasks.loki
 
 # TODO: create common tasks for documentation management
-class Tasks
 
-  if File.exist?(ENV['RR']+'/.config/tocer/configuration.yml')
+# RR normally comes from the repo's .envrc via direnv; fall back to the
+# current directory so asgard still loads in a non-direnv shell instead of
+# crashing every task with a NoMethodError on nil.
+class Tasks
+  rr = ENV.fetch('RR', Dir.pwd)
+
+  if File.exist?("#{rr}/.config/tocer/configuration.yml")
     desc "Management table of contents"
     def tocer = sh "tocer help"
   end
 
 
-  if File.exist?(ENV['RR']+'/mkdocs.yml')
+  if File.exist?("#{rr}/mkdocs.yml")
     desc "Documentation builder"
     def doc_builder = sh "mkdocs build"
 

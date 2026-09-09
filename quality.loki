@@ -11,6 +11,12 @@
 # need to redeclare or extend anything.
 
 class Tasks
+  # Directories the structural gates (flog / flay / reek / fasterer) scan.
+  # Gems keep the lib/ default; a component whose source lives elsewhere
+  # (e.g. a Rails app's app/) overrides this in its own .loki with a plain
+  # assignment: @@quality_dirs = %w[app lib].freeze
+  @@quality_dirs ||= %w[lib].freeze
+
   desc "Run the test suite"
   def test_check
     output = `bundle exec rake test 2>&1`
@@ -62,7 +68,7 @@ class Tasks
     method_fail = 50.0
 
     flogger = Flog.new(all: true)
-    flogger.flog(*Dir.glob("lib/**/*.rb"))
+    flogger.flog(*quality_source_files)
 
     warnings = []
     failures = []
@@ -96,7 +102,7 @@ class Tasks
     mass_threshold = 150
 
     flay = Flay.new(mass: mass_threshold, diff: false, verbose: false, summary: false, timeout: 60)
-    flay.process(*Dir.glob("lib/**/*.rb"))
+    flay.process(*quality_source_files)
     flay.analyze
 
     result = flay.hashes.empty? ? :pass : :fail
@@ -114,7 +120,7 @@ class Tasks
 
   desc "Check code smells with Reek"
   def reek_check
-    output = `bundle exec reek lib 2>&1`
+    output = `bundle exec reek #{@@quality_dirs.join(' ')} 2>&1`
     result = $?.success? ? :pass : :fail
     File.write("reek_output.txt", output)
     summary = output.lines.reverse.find { |l| l =~ /total warnings?/ }&.strip || result.to_s
@@ -145,6 +151,7 @@ class Tasks
   desc "Check ERB templates for style and safety issues with ERBLint"
   def erb_lint_check
     return skip_erb_lint if Dir.glob("**/*.erb").empty?
+    return skip_erb_lint_gem unless bundled_gem?("erb_lint")
 
     # --enable-all-linters overrides a repo's own .erb_lint.yml, which defeats
     # the point of a repo opting into its own linter selection (e.g. disabling
@@ -161,7 +168,7 @@ class Tasks
 
   desc "Check for performance suggestions with Fasterer"
   def fasterer_check
-    output = `bundle exec fasterer lib 2>&1`.gsub(/\e\[\d+m/, "")
+    output = `bundle exec fasterer #{@@quality_dirs.join(' ')} 2>&1`.gsub(/\e\[\d+m/, "")
     result = $?.success? ? :pass : :warn
     File.write("fasterer_output.txt", output)
     summary = output.lines.find { |l| l =~ /files? inspected/ }&.strip || result.to_s
@@ -174,8 +181,20 @@ class Tasks
     # Prefer the repo's own bin/bundler-audit when it has one -- some apps
     # (e.g. ones that bundle via Gemfile.local instead of Gemfile) wrap the
     # command with the --gemfile_lock/--config flags their convention needs.
-    # Falls back to the generic invocation otherwise.
-    command = File.exist?("bin/bundler-audit") ? "bin/bundler-audit" : "bundle exec bundle-audit check --update"
+    # Next best is the bundled gem. A repo without either falls back to the
+    # globally installed CLI pointed at the active lockfile -- bundler-audit
+    # only parses the lockfile, so it doesn't need to be in the bundle, and
+    # this is a security gate that should run wherever a lockfile exists.
+    command =
+      if File.exist?("bin/bundler-audit")
+        "bin/bundler-audit"
+      elsif bundled_gem?("bundler-audit")
+        "bundle exec bundle-audit check --update"
+      elsif command_available?("bundle-audit")
+        "bundle-audit check --update --gemfile-lock #{bundle_lockfile}"
+      else
+        return skip_bundler_audit
+      end
     output = `#{command} 2>&1`
     result = $?.success? ? :pass : :fail
     File.write("bundler_audit_output.txt", output)
@@ -212,6 +231,23 @@ class Tasks
   }.freeze
 
   no_commands do
+    # Ruby files under the configured @@quality_dirs.
+    def quality_source_files
+      @@quality_dirs.flat_map { |dir| Dir.glob("#{dir}/**/*.rb") }
+    end
+
+    # Lockfile for the active Gemfile (BUNDLE_GEMFILE-aware, e.g. the
+    # Gemfile.local convention used across these repos).
+    def bundle_lockfile
+      "#{ENV.fetch('BUNDLE_GEMFILE', 'Gemfile')}.lock"
+    end
+
+    # true when +name+ is resolved into the current bundle's lockfile.
+    def bundled_gem?(name)
+      File.exist?(bundle_lockfile) &&
+        File.read(bundle_lockfile).match?(/^ {4}#{Regexp.escape(name)} \(/)
+    end
+
     # true if +name+ resolves to an executable file somewhere on PATH.
     def command_available?(name)
       ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).any? do |dir|
@@ -232,6 +268,18 @@ class Tasks
 
     def skip_erb_lint
       puts "ERBLint: SKIPPED — no .erb files found."
+      :skip
+    end
+
+    def skip_erb_lint_gem
+      puts "ERBLint: SKIPPED — erb_lint is not in this repo's bundle. " \
+        "Add it to the Gemfile's development group to enable this gate."
+      :skip
+    end
+
+    def skip_bundler_audit
+      puts "Bundler Audit: SKIPPED — bundler-audit not found in the bundle or on PATH. " \
+        "Install it with `gem install bundler-audit`."
       :skip
     end
 
