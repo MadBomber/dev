@@ -189,7 +189,10 @@ class Tasks
       if File.exist?("bin/bundler-audit")
         "bin/bundler-audit"
       elsif bundled_gem?("bundler-audit")
-        "bundle exec bundle-audit check --update"
+        # --gemfile-lock here too: without it bundle-audit defaults to
+        # ./Gemfile.lock even when the bundle is running from Gemfile.local,
+        # so the gate would audit the inactive lockfile.
+        "bundle exec bundle-audit check --update --gemfile-lock #{bundle_lockfile}"
       elsif command_available?("bundle-audit")
         "bundle-audit check --update --gemfile-lock #{bundle_lockfile}"
       else

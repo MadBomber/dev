@@ -54,7 +54,9 @@ class Tasks
       return puts "Aborted." unless $stdin.gets.strip.downcase == "y"
     end
 
-    abort "Working directory is not clean — commit or stash changes first." unless `git status --porcelain`.strip.empty?
+    # Untracked files never reach the gem (git ls-files-based gemspecs), so
+    # only modifications to tracked files block a release.
+    abort "Working directory is not clean — commit or stash changes first." unless `git status --porcelain --untracked-files=no`.strip.empty?
 
     tag = "v#{version}"
     abort "Tag #{tag} already exists." unless `git tag -l "#{tag}"`.strip.empty?
