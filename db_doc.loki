@@ -1,0 +1,62 @@
+# linda-crnic/vbr/db_doc.loki
+#
+# tbls (https://github.com/k1low/tbls) support tasks: database schema docs
+# generated from the live dev database into notes/dbdoc (untracked, like the
+# rest of notes/). Imported from this repo's .loki.
+#
+# tbls runs on the host against the devcontainer's Postgres, which is
+# published on localhost:5432. The login shell exports PGGSSENCMODE, which
+# tbls' lib/pq driver rejects, so every tbls invocation unsets it.
+
+require "fileutils"
+
+class Tasks
+  # Override with DB_DOC_DSN when pointing tbls at a different database.
+  @@db_doc_dsn  = ENV.fetch("DB_DOC_DSN",
+                            "postgres://postgres:postgres@localhost:5432/vbr_development?sslmode=disable")
+  @@db_doc_path = "notes/dbdoc"
+  @@tbls        = "env -u PGGSSENCMODE tbls"
+
+  helper(:db_doc_guard) do
+    abort "tbls not found — brew install k1LoW/tap/tbls" if `which tbls`.strip.empty?
+    system("pg_isready -h localhost -p 5432 -q") ||
+      abort("Postgres not reachable on localhost:5432 — is the devcontainer running?")
+  end
+
+  desc "Generate database schema docs with tbls"
+  def db_doc
+    db_doc_guard
+    sh "#{@@tbls} doc --force #{@@db_doc_dsn} #{@@db_doc_path}"
+    puts "Schema docs in #{@@db_doc_path}/ (index: README.md, full ERD: schema.svg)"
+  end
+
+  desc "Diff the live schema against the generated docs (no output = in sync)"
+  def db_doc_diff
+    db_doc_guard
+    sh "#{@@tbls} diff #{@@db_doc_dsn} #{@@db_doc_path}"
+  end
+
+  # Named *_diff rather than *_check deliberately: quality.loki sweeps every
+  # *_check task into `asgard quality`, and this one needs a running
+  # devcontainer plus a migrated dev DB — too environment-dependent for the
+  # default gate. Rename it db_doc_check to opt in.
+
+  desc "Export the schema as a Mermaid ER diagram"
+  def db_doc_mermaid
+    db_doc_guard
+    sh "#{@@tbls} out --dsn #{@@db_doc_dsn} -t mermaid -o #{@@db_doc_path}/schema.mmd"
+    puts "Mermaid ERD written to #{@@db_doc_path}/schema.mmd"
+  end
+
+  desc "Open the full-schema ER diagram"
+  def db_doc_open
+    svg = "#{@@db_doc_path}/schema.svg"
+    File.exist?(svg) ? sh("open #{svg}") : abort("#{svg} not found — run db_doc first.")
+  end
+
+  desc "Remove the generated schema docs"
+  def db_doc_clean
+    FileUtils.rm_rf(@@db_doc_path)
+    puts "Removed #{@@db_doc_path}/"
+  end
+end
