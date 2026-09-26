@@ -1,129 +1,33 @@
 # frozen_string_literal: true
-# Pure helpers behind schedule.loki: turn a `schedule` declaration into a
-# launchd agent plist. Nothing here calls launchctl or writes files, so each
-# method can be tested on its own.
+# macOS backend for schedule.loki: each declaration becomes a launchd user
+# agent (~/Library/LaunchAgents/com.madbomber.asgard.<project>.<name>.plist).
+# launchd runs a calendar job missed while the Mac slept as soon as it wakes.
+# Implements the backend API documented in schedule_declaration.rb.
 
-require "shellwords"
+require "fileutils"
+require_relative "schedule_declaration"
 
-module LaunchdSchedule
+class LaunchdSchedule
   LABEL_PREFIX = "com.madbomber.asgard"
 
-  # launchd numbers weekdays 0 (Sunday) through 6 (Saturday).
-  DAYS = %i[sunday monday tuesday wednesday thursday friday saturday].freeze
+  # ---- pure helpers -------------------------------------------------------
 
-  DAY_GROUPS = {
-    weekdays: %i[monday tuesday wednesday thursday friday],
-    weekends: %i[saturday sunday]
-  }.freeze
+  def self.label_prefix(project) = "#{LABEL_PREFIX}.#{ScheduleDeclaration.slug(project)}."
 
-  module_function
-
-  # Validates a declaration and returns it as a plain Hash. options: is the
-  # task's command-line options as a String, split shell-style with quotes
-  # respected ("--period week --title 'Week End'"), or an Array of words.
-  # Exactly one of at: ("HH:MM" or an Array of them, with on:) or every:
-  # (seconds) is required. as: names the entry (and its launchd label).
-  def normalize(task, options: nil, at: nil, on: :daily, every: nil, env: {}, as: nil)
-    task = task.to_s
-    raise ArgumentError, "schedule: task name #{task.inspect} must be a single word; put its flags in options:" unless task.match?(/\A[\w:-]+\z/)
-    raise ArgumentError, "schedule :#{task} needs either at: or every:, not both" unless at.nil? ^ every.nil?
-
-    if every
-      every = seconds(every)
-      raise ArgumentError, "schedule :#{task} every: must be a positive number of seconds or a Duration (3.minutes)" unless every&.positive?
-    else
-      calendar_intervals(at:, on:) # raises on a bad time or day
-    end
-
-    args = options.is_a?(Array) ? options.map(&:to_s) : Shellwords.split(options.to_s)
-    { name: entry_name(task, args, as), task:, args:, at:, on:, every:, env: env.to_h { |k, v| [k.to_s, v.to_s] } }
-  end
-
-  # Integer seconds from an Integer or anything Duration-like (ActiveSupport's
-  # 3.minutes responds to in_seconds); nil for anything else.
-  def seconds(value)
-    case value
-    in Integer then value
-    else value.respond_to?(:in_seconds) ? value.in_seconds.to_i : nil
-    end
-  end
-
-  # The task alone, or a slug of the whole command when it has arguments,
-  # so one task can be scheduled more than once with different flags.
-  def entry_name(task, args, as = nil)
-    name = (as || (args.empty? ? task : slug([task, *args].join(" ")))).to_s
-    raise ArgumentError, "schedule as: #{name.inspect} may only contain letters, digits, _ . -" unless name.match?(/\A[\w.-]+\z/)
-
-    name
-  end
-
-  # For display: the command line the job runs.
-  def command_line(task, args = []) = Shellwords.join(["asgard", task.to_s, *args])
-
-  def slug(name) = name.to_s.downcase.gsub(/[^a-z0-9]+/, "-").delete_prefix("-").delete_suffix("-")
-
-  def project_prefix(project) = "#{LABEL_PREFIX}.#{slug(project)}."
-
-  def label(project, task) = "#{project_prefix(project)}#{task}"
-
-  # "17:30" => [17, 30]
-  def parse_time(time)
-    match = /\A(\d{1,2}):(\d{2})\z/.match(time.to_s) or
-      raise ArgumentError, %(at: expects "HH:MM" (got #{time.inspect}))
-    hour, minute = match[1].to_i, match[2].to_i
-    raise ArgumentError, "at: #{time.inspect} is not a valid time" unless hour <= 23 && minute <= 59
-
-    [hour, minute]
-  end
-
-  # :daily => [nil]; :weekdays => [1, 2, 3, 4, 5]; :friday => [5];
-  # %i[monday thursday] => [1, 4]
-  def weekdays(on)
-    return [nil] if on.to_s == "daily"
-
-    names = DAY_GROUPS.fetch(on.is_a?(Array) ? nil : on.to_sym) { Array(on) }
-    names.map do |day|
-      DAYS.index(day.to_sym) or raise ArgumentError, "on: unknown day #{day.inspect}"
-    end
-  end
+  def self.label(project, name) = "#{label_prefix(project)}#{name}"
 
   # One StartCalendarInterval entry per (time, weekday) pair.
-  def calendar_intervals(at:, on: :daily)
-    Array(at).flat_map do |time|
-      hour, minute = parse_time(time)
-      weekdays(on).map { |day| { "Hour" => hour, "Minute" => minute, "Weekday" => day }.compact }
+  def self.calendar_intervals(at:, on: :daily)
+    ScheduleDeclaration.calendar(at:, on:).flat_map do |entry|
+      (entry[:days] || [nil]).map { |day| { "Hour" => entry[:hour], "Minute" => entry[:minute], "Weekday" => day }.compact }
     end
-  end
-
-  def describe(at: nil, on: :daily, every: nil, **)
-    return "every #{every}s" if every
-
-    "#{Array(at).join(', ')} #{Array(on).join(', ')}"
   end
 
   # Labels marked disabled in `launchctl print-disabled` output
   # ("label" => disabled, or "label" => true on older macOS).
-  def disabled_labels(output)
-    output.scan(/"([^"]+)"\s*=>\s*(disabled|true)\b/).map(&:first)
-  end
+  def self.disabled_labels(output) = output.scan(/"([^"]+)"\s*=>\s*(disabled|true)\b/).map(&:first)
 
-  # First executable named +command+ on +path+ (a PATH-style String), or nil.
-  def which(command, path)
-    path.to_s.split(File::PATH_SEPARATOR)
-        .map { File.join(it, command) }
-        .find { File.file?(it) && File.executable?(it) }
-  end
-
-  # launchd needs an absolute program. With direnv, the repo's .envrc
-  # (RR, API keys, ...) is loaded at run time instead of being copied into
-  # the plist, and direnv finds asgard on the plist's PATH.
-  # Each argument is its own array element, so no shell re-splits them.
-  def program_arguments(task, args = [], root:, asgard:, direnv: nil)
-    argv = [task.to_s, *args.map(&:to_s)]
-    direnv ? [direnv, "exec", root, "asgard", *argv] : [asgard, *argv]
-  end
-
-  def plist(label:, arguments:, working_directory:, environment:, log_path:, intervals: nil, every: nil)
+  def self.plist(label:, arguments:, working_directory:, environment:, log_path:, intervals: nil, every: nil)
     dict = {
       "Label"                => label,
       "ProgramArguments"     => arguments,
@@ -143,7 +47,7 @@ module LaunchdSchedule
     XML
   end
 
-  def to_xml(value, indent = "")
+  def self.to_xml(value, indent = "")
     case value
     in Hash
       body = value.flat_map { |k, v| ["#{indent}  <key>#{escape(k)}</key>", to_xml(v, "#{indent}  ")] }
@@ -159,5 +63,115 @@ module LaunchdSchedule
     end
   end
 
-  def escape(text) = text.to_s.gsub("&", "&amp;").gsub("<", "&lt;").gsub(">", "&gt;")
+  def self.escape(text) = text.to_s.gsub("&", "&amp;").gsub("<", "&lt;").gsub(">", "&gt;")
+
+  # ---- backend API --------------------------------------------------------
+
+  def initialize(project:, root:, home: Dir.home, runner: ScheduleDeclaration::RUNNER, uid: Process.uid)
+    @project = project
+    @root    = root
+    @home    = home
+    @runner  = runner
+    @domain  = "gui/#{uid}"
+  end
+
+  def scheduler = "launchd"
+
+  def label(name) = self.class.label(@project, name)
+
+  def plist_path(name) = File.join(@home, "Library", "LaunchAgents", "#{label(name)}.plist")
+
+  def log_path(name) = File.join(@home, "Library", "Logs", "asgard", "#{label(name)}.log")
+
+  def files(spec, asgard:, direnv:)
+    name = spec[:name]
+    plist = self.class.plist(
+      label:             label(name),
+      arguments:         ScheduleDeclaration.program_arguments(spec[:task], spec[:args], root: @root, asgard:, direnv:),
+      working_directory: @root,
+      environment:       ScheduleDeclaration.environment(spec),
+      log_path:          log_path(name),
+      intervals:         spec[:every] ? nil : self.class.calendar_intervals(at: spec[:at], on: spec[:on]),
+      every:             spec[:every]
+    )
+    { plist_path(name) => plist }
+  end
+
+  def install(spec, asgard:, direnv:)
+    name = spec[:name]
+    FileUtils.mkdir_p [File.dirname(plist_path(name)), File.dirname(log_path(name))]
+    files(spec, asgard:, direnv:).each { |path, content| File.write(path, content) }
+    run! "plutil", "-lint", "-s", plist_path(name)
+    unload(name)
+    return :stopped if stopped?(name)
+
+    run! "launchctl", "bootstrap", @domain, plist_path(name)
+    :active
+  end
+
+  def uninstall(name)
+    unload(name)
+    run "launchctl", "enable", target(name) # clear any stop
+    FileUtils.rm_f(plist_path(name))
+  end
+
+  def start(name)
+    run! "launchctl", "enable", target(name)
+    run! "launchctl", "bootstrap", @domain, plist_path(name) unless loaded?(name)
+  end
+
+  def stop(name)
+    run! "launchctl", "disable", target(name)
+    unload(name)
+  end
+
+  def trigger(name) = run!("launchctl", "kickstart", target(name))
+
+  def installed_names
+    prefix = self.class.label_prefix(@project)
+    Dir.glob(plist_path("*")).map { File.basename(it, ".plist").delete_prefix(prefix) }.sort
+  end
+
+  def status(name)
+    out, ok = run("launchctl", "print", target(name))
+    return { state: stopped?(name) ? :stopped : :not_loaded, last_exit: nil } unless ok
+
+    code = out[/last exit code = (\d+)/, 1]
+    { state: :active, last_exit: code }
+  end
+
+  def notes = []
+
+  private
+
+  def target(name) = "#{@domain}/#{label(name)}"
+
+  def loaded?(name) = run("launchctl", "print", target(name)).last
+
+  def stopped?(name)
+    out, = run("launchctl", "print-disabled", @domain)
+    self.class.disabled_labels(out).include?(label(name))
+  end
+
+  # bootout returns before the job is fully gone; bootstrapping the same
+  # label too soon fails with "Input/output error", so wait for it.
+  def unload(name)
+    return unless loaded?(name)
+
+    run "launchctl", "bootout", target(name)
+    20.times do
+      break unless loaded?(name)
+
+      sleep 0.1
+    end
+  end
+
+  def run(*argv) = @runner.call(*argv)
+
+  def run!(*argv)
+    out, ok = run(*argv)
+    raise ScheduleDeclaration::Error, "#{argv.join(' ')} failed: #{out.strip}" unless ok
+
+    out
+  end
 end

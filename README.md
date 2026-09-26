@@ -45,7 +45,7 @@ whose `push` also pushes tags).
 | `doc_tasks.loki` | Documentation tasks (`tocer`, `mkdocs` build/serve), enabled per repo |
 | `status_report.loki` | End-of-week client status reporting: `daily_summary`, `weekly_report` |
 | `iterm_tasks.loki` | Terminal fixes: `half_duplex_screen_fix`, `clear_scroll_back_buffer` |
-| `schedule.loki` | Scheduled tasks via macOS launchd: `schedule` helper plus `asgard schedule preview|install|list|trigger|remove` |
+| `schedule.loki` | Scheduled tasks via launchd (macOS) or systemd (Linux): `schedule` helper plus `asgard schedule preview|install|list|start|stop|trigger|log|remove` |
 | `rubocop-strict.yml` | Cops that must always fire, regardless of `.rubocop_todo.yml` or inline directives |
 
 ### gem_tasks.loki
@@ -109,11 +109,11 @@ be redeclared.
 
 ### schedule.loki
 
-Runs asgard tasks on a schedule with macOS launchd, declared right in the
-repo's own `.loki`. Unlike cron, launchd runs a job missed while the Mac
-slept as soon as it wakes. Needs the `activesupport` gem installed (for
-`every: 3.minutes`-style durations); the pure plist logic lives in
-`lib/launchd_schedule.rb` (tested by `ruby test/launchd_schedule_test.rb`).
+Runs asgard tasks on a schedule, declared right in the repo's own `.loki`,
+using the platform's own scheduler: **launchd** on macOS, **systemd user
+timers** on Linux. Both run a calendar job missed while the machine slept as
+soon as it wakes. Needs the `activesupport` gem installed (for
+`every: 3.minutes`-style durations).
 
 ```ruby
 # .loki
@@ -132,29 +132,41 @@ end
 
 `on:` takes `:daily` (default), `:weekdays`, `:weekends`, a day, or an array
 of days; `at:` may be an array of times; `options:` may also be an array of
-words; `env:` adds literal variables.
-Each entry has a name, used in its launchd label and by `asgard schedule trigger`: the
-task name, a slug of the task plus its options (`:report, options: "-v"` →
-`report-v`), or whatever `as:` gives. So one task can be scheduled several
-times with different flags; two different entries with the same name raise.
+words; `env:` adds literal variables. Each entry has a name, used by the
+subcommands below: the task name, a slug of the task plus its options
+(`:report, options: "-v"` → `report-v`), or whatever `as:` gives. So one
+task can be scheduled several times with different flags; two different
+entries with the same name raise.
 
-`schedule` is also a command with subcommands:
+`schedule` is also a command with subcommands (same on both platforms):
 
-- `asgard schedule preview` — prints the plists that would be installed
-- `asgard schedule install` — writes and loads one agent per declaration; removes agents no longer declared
+- `asgard schedule preview` — prints the job files that would be installed
+- `asgard schedule install` — writes and loads one job per declaration; removes jobs no longer declared
 - `asgard schedule list` — installed entries, their command, schedule, state (active/stopped), and last exit status
 - `asgard schedule stop NAME` — stops one entry; it stays stopped across reboots and `install` until started
 - `asgard schedule start NAME` — starts a stopped entry, or installs and starts just that declared entry
-- `asgard schedule trigger NAME` — runs an installed entry now, under launchd's environment
+- `asgard schedule trigger NAME` — runs an installed entry now, under the scheduler's environment
 - `asgard schedule log NAME` — prints the entry's log to STDOUT; `-f` keeps following it
-- `asgard schedule remove` — unloads and deletes all of this project's agents
+- `asgard schedule remove` — unloads and deletes all of this project's jobs
 
-Agents are labelled `com.madbomber.asgard.<project>.<name>` (project = the
-directory holding `.loki`), run `asgard <task> [options]` from that directory with the
-PATH captured at install time, and log to `~/Library/Logs/asgard/`. If the
-repo has a `.envrc`, jobs run under `direnv exec` so `RR`, API keys, etc.
-load at run time and never land in the plist. Re-run `asgard schedule install`
-after changing declarations or your PATH.
+Jobs run `asgard <task> [options]` from the directory holding `.loki` with the
+PATH captured at install time. If the repo has a `.envrc`, jobs run under
+`direnv exec` so `RR`, API keys, etc. load at run time and never land in the
+job files. Re-run `asgard schedule install` after changing declarations or
+your PATH.
+
+| | macOS (launchd) | Linux (systemd) |
+|---|---|---|
+| Job files | `~/Library/LaunchAgents/com.madbomber.asgard.<project>.<name>.plist` | `~/.config/systemd/user/asgard.<project>.<name>.{service,timer}` |
+| Logs | `~/Library/Logs/asgard/` | `~/.local/state/asgard/` |
+| Stop | `launchctl disable` | `systemctl --user disable --now` |
+| Caveat | runs only while you're logged in | runs only while you're logged in unless `loginctl enable-linger`; needs systemd 240+ |
+
+Code layout: `lib/schedule_declaration.rb` (declarations, platform-neutral,
+and the backend API both platforms implement), `lib/launchd_schedule.rb`
+(macOS only), `lib/systemd_schedule.rb` (Linux only). Tests:
+`ruby test/<name>_test.rb` for each; both backends' tests run on any
+platform because system commands go through an injectable runner.
 
 ### rubocop-strict.yml
 

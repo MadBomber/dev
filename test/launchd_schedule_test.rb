@@ -4,73 +4,20 @@ require "minitest/autorun"
 require "open3"
 require "tmpdir"
 require_relative "../lib/launchd_schedule"
+require_relative "fake_runner"
 
 class LaunchdScheduleTest < Minitest::Test
+  def spec(**) = ScheduleDeclaration.normalize(:demo, **)
+
+  def backend(home, runner = FakeRunner.new) = LaunchdSchedule.new(project: "My App", root: "/proj", home:, runner:, uid: 501)
+
   def test_label_slugs_the_project
     assert_equal "com.madbomber.asgard.my-app.sync", LaunchdSchedule.label("My_App", :sync)
   end
 
-  def test_parse_time
-    assert_equal [7, 5], LaunchdSchedule.parse_time("7:05")
-    assert_raises(ArgumentError) { LaunchdSchedule.parse_time("24:00") }
-    assert_raises(ArgumentError) { LaunchdSchedule.parse_time("5pm") }
-  end
-
-  def test_weekdays
-    assert_equal [nil], LaunchdSchedule.weekdays(:daily)
-    assert_equal [1, 2, 3, 4, 5], LaunchdSchedule.weekdays(:weekdays)
-    assert_equal [6, 0], LaunchdSchedule.weekdays(:weekends)
-    assert_equal [5], LaunchdSchedule.weekdays(:friday)
-    assert_equal [1, 4], LaunchdSchedule.weekdays(%i[monday thursday])
-    assert_raises(ArgumentError) { LaunchdSchedule.weekdays(:funday) }
-  end
-
-  def test_calendar_intervals_crosses_times_and_days
+  def test_calendar_intervals_cross_times_and_days
     assert_equal [{ "Hour" => 2, "Minute" => 0 }], LaunchdSchedule.calendar_intervals(at: "02:00")
     assert_equal 4, LaunchdSchedule.calendar_intervals(at: %w[09:00 17:00], on: %i[monday friday]).size
-  end
-
-  def test_normalize_requires_exactly_one_of_at_or_every
-    assert_raises(ArgumentError) { LaunchdSchedule.normalize(:x) }
-    assert_raises(ArgumentError) { LaunchdSchedule.normalize(:x, at: "01:00", every: 60) }
-    assert_raises(ArgumentError) { LaunchdSchedule.normalize(:x, every: 0) }
-    assert_equal({ "A" => "1" }, LaunchdSchedule.normalize(:x, every: 60, env: { A: 1 })[:env])
-  end
-
-  def test_normalize_splits_options_shell_style
-    spec = LaunchdSchedule.normalize(:report, options: "--format md --title 'Week 39' -v", every: 60)
-    assert_equal "report", spec[:task]
-    assert_equal ["--format", "md", "--title", "Week 39", "-v"], spec[:args]
-    assert_equal "report-format-md-title-week-39-v", spec[:name]
-  end
-
-  def test_normalize_accepts_options_as_array
-    assert_equal ["--title", "Week 39"], LaunchdSchedule.normalize(:report, options: ["--title", "Week 39"], every: 60)[:args]
-  end
-
-  def test_normalize_names
-    assert_equal "sync", LaunchdSchedule.normalize(:sync, every: 60)[:name]
-    assert_equal "sync", LaunchdSchedule.normalize(:sync, options: "", every: 60)[:name]
-    assert_equal "weekly", LaunchdSchedule.normalize(:report, options: "--period week", every: 60, as: "weekly")[:name]
-    assert_raises(ArgumentError) { LaunchdSchedule.normalize(:report, options: "-v", every: 60, as: "bad name") }
-  end
-
-  def test_normalize_rejects_flags_in_the_task_name
-    assert_raises(ArgumentError) { LaunchdSchedule.normalize("report -v", every: 60) }
-    assert_raises(ArgumentError) { LaunchdSchedule.normalize("", every: 60) }
-  end
-
-  def test_command_line_requotes_args
-    assert_equal "asgard report --title Week\\ 39", LaunchdSchedule.command_line("report", ["--title", "Week 39"])
-  end
-
-  def test_seconds_accepts_integers_and_durations
-    duration = Struct.new(:in_seconds).new(180.0)
-    assert_equal 90, LaunchdSchedule.seconds(90)
-    assert_equal 180, LaunchdSchedule.seconds(duration)
-    assert_nil LaunchdSchedule.seconds("3m")
-    assert_equal 180, LaunchdSchedule.normalize(:sync, every: duration)[:every]
-    assert_raises(ArgumentError) { LaunchdSchedule.normalize(:sync, every: "3m") }
   end
 
   def test_disabled_labels
@@ -85,24 +32,6 @@ class LaunchdScheduleTest < Minitest::Test
     assert_equal %w[com.madbomber.asgard.temp.demo com.example.old], LaunchdSchedule.disabled_labels(output)
   end
 
-  def test_program_arguments
-    assert_equal %w[/bin/asgard sync], LaunchdSchedule.program_arguments(:sync, root: "/r", asgard: "/bin/asgard")
-    assert_equal ["/bin/asgard", "report", "--title", "Week 39"],
-                 LaunchdSchedule.program_arguments("report", ["--title", "Week 39"], root: "/r", asgard: "/bin/asgard")
-    assert_equal %w[/bin/direnv exec /r asgard report -v],
-                 LaunchdSchedule.program_arguments("report", ["-v"], root: "/r", asgard: "/bin/asgard", direnv: "/bin/direnv")
-  end
-
-  def test_which
-    Dir.mktmpdir do |dir|
-      tool = File.join(dir, "tool")
-      File.write(tool, "")
-      assert_nil LaunchdSchedule.which("tool", dir)
-      File.chmod(0o755, tool)
-      assert_equal tool, LaunchdSchedule.which("tool", "/nonexistent:#{dir}")
-    end
-  end
-
   def test_plist_is_valid_and_escaped
     xml = LaunchdSchedule.plist(
       label: "com.madbomber.asgard.demo.sync", arguments: %w[/bin/asgard sync],
@@ -111,8 +40,8 @@ class LaunchdScheduleTest < Minitest::Test
     )
     assert_includes xml, "<string>/tmp/a&amp;b</string>"
     assert_includes xml, "<key>StartCalendarInterval</key>"
-    _, status = Open3.capture2("plutil", "-lint", "-s", "-", stdin_data: xml)
-    assert status.success?, "plutil rejected:\n#{xml}"
+    _, status = Open3.capture2("plutil", "-lint", "-s", "-", stdin_data: xml) if system("which -s plutil")
+    assert status.success?, "plutil rejected:\n#{xml}" if status
   end
 
   def test_plist_with_start_interval
@@ -120,5 +49,74 @@ class LaunchdScheduleTest < Minitest::Test
                                 log_path: "/tmp/l.log", every: 3600)
     assert_includes xml, "<key>StartInterval</key>\n  <integer>3600</integer>"
     refute_includes xml, "StartCalendarInterval"
+  end
+
+  def test_paths_live_under_home
+    b = backend("/h")
+    assert_equal "/h/Library/LaunchAgents/com.madbomber.asgard.my-app.demo.plist", b.plist_path("demo")
+    assert_equal "/h/Library/Logs/asgard/com.madbomber.asgard.my-app.demo.log", b.log_path("demo")
+  end
+
+  def test_install_writes_plist_and_bootstraps
+    Dir.mktmpdir do |home|
+      runner = FakeRunner.new("launchctl print gui" => ["", false])
+      state  = backend(home, runner).install(spec(every: 60), asgard: "/bin/asgard", direnv: nil)
+      assert_equal :active, state
+      assert File.exist?(File.join(home, "Library/LaunchAgents/com.madbomber.asgard.my-app.demo.plist"))
+      assert(runner.commands.any? { it.start_with?("launchctl bootstrap gui/501 ") })
+    end
+  end
+
+  def test_install_keeps_a_stopped_entry_stopped
+    Dir.mktmpdir do |home|
+      runner = FakeRunner.new(
+        "launchctl print gui"      => ["", false],
+        "launchctl print-disabled" => [%(\t"com.madbomber.asgard.my-app.demo" => disabled\n), true]
+      )
+      assert_equal :stopped, backend(home, runner).install(spec(every: 60), asgard: "/bin/asgard", direnv: nil)
+      refute(runner.commands.any? { it.include?("bootstrap") })
+    end
+  end
+
+  def test_install_raises_on_launchctl_failure
+    Dir.mktmpdir do |home|
+      runner = FakeRunner.new("launchctl print gui" => ["", false], "launchctl bootstrap" => ["Bootstrap failed: 5", false])
+      assert_raises(ScheduleDeclaration::Error) { backend(home, runner).install(spec(every: 60), asgard: "/a", direnv: nil) }
+    end
+  end
+
+  def test_stop_and_start
+    runner = FakeRunner.new("launchctl print gui" => ["", false])
+    b = backend("/h", runner)
+    b.stop("demo")
+    b.start("demo")
+    assert_equal ["launchctl disable gui/501/com.madbomber.asgard.my-app.demo",
+                  "launchctl print gui/501/com.madbomber.asgard.my-app.demo",
+                  "launchctl enable gui/501/com.madbomber.asgard.my-app.demo",
+                  "launchctl print gui/501/com.madbomber.asgard.my-app.demo",
+                  "launchctl bootstrap gui/501 /h/Library/LaunchAgents/com.madbomber.asgard.my-app.demo.plist"], runner.commands
+  end
+
+  def test_status
+    active = FakeRunner.new("launchctl print gui" => ["state = not running\n\tlast exit code = 0\n", true])
+    assert_equal({ state: :active, last_exit: "0" }, backend("/h", active).status("demo"))
+
+    never = FakeRunner.new("launchctl print gui" => ["last exit code = (never exited)\n", true])
+    assert_equal({ state: :active, last_exit: nil }, backend("/h", never).status("demo"))
+
+    stopped = FakeRunner.new("launchctl print gui"      => ["", false],
+                             "launchctl print-disabled" => [%("com.madbomber.asgard.my-app.demo" => disabled), true])
+    assert_equal :stopped, backend("/h", stopped).status("demo")[:state]
+  end
+
+  def test_installed_names
+    Dir.mktmpdir do |home|
+      dir = File.join(home, "Library/LaunchAgents")
+      FileUtils.mkdir_p(dir)
+      %w[com.madbomber.asgard.my-app.b com.madbomber.asgard.my-app.a com.madbomber.asgard.other.c].each do
+        File.write(File.join(dir, "#{it}.plist"), "")
+      end
+      assert_equal %w[a b], backend(home).installed_names
+    end
   end
 end
