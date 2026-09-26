@@ -43,7 +43,9 @@ whose `push` also pushes tags).
 | `quality_rails.loki` | Rails-only checks: Brakeman, RailsBestPractices, ActiveRecordDoctor |
 | `git.loki` | Per-repo git basics: `push`, `pull` (ff-only), `fetch` |
 | `doc_tasks.loki` | Documentation tasks (`tocer`, `mkdocs` build/serve), enabled per repo |
+| `status_report.loki` | End-of-week client status reporting: `daily_summary`, `weekly_report` |
 | `iterm_tasks.loki` | Terminal fixes: `half_duplex_screen_fix`, `clear_scroll_back_buffer` |
+| `schedule.loki` | Scheduled tasks via macOS launchd: `schedule` helper plus `asgard schedule preview|install|list|trigger|remove` |
 | `rubocop-strict.yml` | Cops that must always fire, regardless of `.rubocop_todo.yml` or inline directives |
 
 ### gem_tasks.loki
@@ -79,6 +81,80 @@ rather than failing; only FAIL blocks. Companion `*_fix` tasks
 Rails-specific `*_check` gates, gated on `RAILS_ROOT` (set in a Rails repo's
 `.envrc`) rather than `defined?(Rails)`, since Asgard runs outside the app's
 process. Once imported, its checks are picked up by `quality` automatically.
+
+### status_report.loki
+
+Personal end-of-week client status reporting. `daily_summary` discovers
+every `*_collect` task the same way `quality` discovers `*_check` tasks,
+runs them, and writes the day's activity to `notes/_status/<date>.md`
+under `RR`. `weekly_report` reads Mon–Fri's daily files and pipes them
+through headless Claude Code (`claude -p`) to produce a client-facing
+Markdown report at `notes/_status/week-of-<monday>.md`.
+
+Each collector is best-effort and never fails the run — a missing tool or
+unset env var just prints a SKIP line instead of aborting the others:
+
+- `notes_collect` — `_notes.txt` journal entries (no config needed)
+- `git_collect` — `git log`, scoped to `git config user.email`
+- `github_collect` — needs `gh` authenticated (`gh auth status`)
+- `jira_collect` — needs `JIRA_SITE`, `JIRA_PROJECT`, `JIRA_USER_EMAIL`,
+  `JIRA_API_KEY`
+- `claude_sessions_collect` — reads `~/.claude/projects/<repo>/*.jsonl`
+- `shell_history_collect` — needs `HISTTIMEFORMAT` set so
+  `~/.bash_history` carries timestamps
+- `calendar_collect` — needs `icalBuddy` (`brew install ical-buddy`)
+
+Add a source by defining another `*_collect` task; nothing else needs to
+be redeclared.
+
+### schedule.loki
+
+Runs asgard tasks on a schedule with macOS launchd, declared right in the
+repo's own `.loki`. Unlike cron, launchd runs a job missed while the Mac
+slept as soon as it wakes. Needs the `activesupport` gem installed (for
+`every: 3.minutes`-style durations); the pure plist logic lives in
+`lib/launchd_schedule.rb` (tested by `ruby test/launchd_schedule_test.rb`).
+
+```ruby
+# .loki
+import_up "dev/schedule.loki"
+
+class Tasks
+  schedule :daily_summary, at: "17:30", on: :weekdays
+  schedule :weekly_report, at: "16:00", on: :friday
+  schedule :sync,          every: 1.hour               # or plain seconds: 3600
+
+  # The task's own flags go in options: (split shell-style, quotes kept)
+  schedule :report, options: "-v",                                at: "08:00", on: :weekdays
+  schedule :report, options: "--period week --title 'Week End'", at: "16:30", on: :friday, as: "weekly_report"
+end
+```
+
+`on:` takes `:daily` (default), `:weekdays`, `:weekends`, a day, or an array
+of days; `at:` may be an array of times; `options:` may also be an array of
+words; `env:` adds literal variables.
+Each entry has a name, used in its launchd label and by `asgard schedule trigger`: the
+task name, a slug of the task plus its options (`:report, options: "-v"` →
+`report-v`), or whatever `as:` gives. So one task can be scheduled several
+times with different flags; two different entries with the same name raise.
+
+`schedule` is also a command with subcommands:
+
+- `asgard schedule preview` — prints the plists that would be installed
+- `asgard schedule install` — writes and loads one agent per declaration; removes agents no longer declared
+- `asgard schedule list` — installed entries, their command, schedule, state (active/stopped), and last exit status
+- `asgard schedule stop NAME` — stops one entry; it stays stopped across reboots and `install` until started
+- `asgard schedule start NAME` — starts a stopped entry, or installs and starts just that declared entry
+- `asgard schedule trigger NAME` — runs an installed entry now, under launchd's environment
+- `asgard schedule log NAME` — prints the entry's log to STDOUT; `-f` keeps following it
+- `asgard schedule remove` — unloads and deletes all of this project's agents
+
+Agents are labelled `com.madbomber.asgard.<project>.<name>` (project = the
+directory holding `.loki`), run `asgard <task> [options]` from that directory with the
+PATH captured at install time, and log to `~/Library/Logs/asgard/`. If the
+repo has a `.envrc`, jobs run under `direnv exec` so `RR`, API keys, etc.
+load at run time and never land in the plist. Re-run `asgard schedule install`
+after changing declarations or your PATH.
 
 ### rubocop-strict.yml
 

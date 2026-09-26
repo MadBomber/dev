@@ -1,0 +1,35 @@
+import_up "schedule.loki"
+
+class Tasks
+  desc "Demo of schedule helper"
+  def demo = puts("demo ran at #{Time.now} in #{Dir.pwd}")
+  schedule :demo,        every: 1.minute  # at: "17:30", on: :weekdays
+
+
+
+  desc "Demo: Friday wrap-up"
+  def friday_wrap = puts("friday_wrap ran at #{Time.now}")
+
+  desc "Demo: hourly heartbeat"
+  def heartbeat = puts("heartbeat #{Time.now} DEMO_MODE=#{ENV['DEMO_MODE']}")
+
+  desc "Demo: twice-daily backup"
+  def backup = puts("backup ran at #{Time.now}")
+
+  desc "Demo: Tuesday/Thursday standup notes"
+  def standup = puts("standup ran at #{Time.now}")
+
+  desc "report", "Demo: a task with options"
+  method_option :period, type: :string, default: "day", desc: "day or week"
+  method_option :title,  type: :string, desc: "Report title"
+  method_option :verbose, aliases: "-v", type: :boolean, desc: "Chatty output"
+  def report = puts("report ran at #{Time.now} with #{options.to_h}")
+
+  # schedule :report, options: "-v",                                at: "08:00", on: :weekdays
+  # schedule :report, options: "--period week --title 'Week End'", at: "16:30", on: :friday, as: "weekly_report"
+
+  # schedule :friday_wrap, at: "16:00", on: :friday
+  # schedule :heartbeat,   every: 3600, env: { "DEMO_MODE" => "on" }
+  # schedule :backup,      at: %w[02:00 14:00]
+  # schedule :standup,     at: "09:15", on: %i[tuesday thursday]
+end

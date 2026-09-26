@@ -1,0 +1,285 @@
+# frozen_string_literal: true
+# Scheduled asgard tasks via macOS launchd. Unlike cron, launchd runs a job
+# that was missed while the Mac slept as soon as it wakes.
+#
+# Import this file, then declare schedules in the repo's own .loki:
+#
+#   import_up "dev/schedule.loki"
+#
+#   class Tasks
+#     schedule :daily_summary, at: "17:30", on: :weekdays
+#     schedule :weekly_report, at: "16:00", on: :friday
+#     schedule :sync,          every: 1.hour                # or plain seconds: 3600
+#     schedule :backup,        at: %w[02:00 14:00]          # on: defaults to :daily
+#
+#     # The task's own options/flags go in options:, split the way a shell
+#     # would (quotes respected).
+#     schedule :report, options: "--format md -v",      at: "08:00", on: :weekdays
+#     schedule :report, options: "--period week",       at: "16:00", on: :friday
+#     schedule :notify, options: "--msg 'backup done'", every: 86_400, as: "notify_daily"
+#   end
+#
+# on: takes :daily, :weekdays, :weekends, a day (:friday), or an Array of days.
+# options: may also be an Array of words (["--title", "Week End"]).
+# env: { "KEY" => "value" } adds literal environment variables to the job.
+# as: "name" names the entry. It defaults to the task name, or to a slug of
+# the task plus its options (:report, options: "--format md -v" =>
+# report-format-md-v), so one task can be scheduled with different flags.
+#
+# Each declaration becomes one launchd agent labelled
+# com.madbomber.asgard.<project>.<name>, where <project> is the basename of
+# the directory holding .loki, so any subdirectory works. The job runs
+# `asgard <task> [options]` from that directory with the PATH that was current at
+# install time. When the repo has a .envrc, the job runs under
+# `direnv exec` so RR, API keys, etc. come from .envrc at run time rather
+# than being copied into the plist. Output goes to ~/Library/Logs/asgard/.
+#
+# `schedule` is both the declaration helper above and a command with
+# subcommands:
+#
+#   asgard schedule preview        # plists that install would write
+#   asgard schedule install        # load declared entries; drop undeclared ones
+#   asgard schedule list           # installed entries, state, last exit status
+#   asgard schedule stop NAME      # stop one entry (stays stopped across reboots and installs)
+#   asgard schedule start NAME     # start a stopped entry, or install just this one
+#   asgard schedule trigger NAME   # run an installed entry now, under launchd
+#   asgard schedule log NAME [-f]  # print the entry's log (-f keeps following it)
+#   asgard schedule remove         # unload and delete all of this project's entries
+
+require "fileutils"
+require "open3"
+require "shellwords"
+require "active_support"
+require "active_support/core_ext/integer/time" # every: 3.minutes, 2.hours, 1.day
+require_relative "lib/launchd_schedule"
+
+class Tasks
+  @@schedules ||= {}
+
+  # Declaration helper, called at class level in a .loki. Distinct from the
+  # instance-level `schedule` command that `subcommand` defines below.
+  def self.schedule(task, **settings)
+    spec  = LaunchdSchedule.normalize(task, **settings)
+    taken = @@schedules[spec[:name]]
+    raise ArgumentError, "schedule: #{spec[:name].inspect} is already declared; give one a distinct as: name" if taken && taken != spec
+
+    @@schedules[spec[:name]] = spec
+  end
+
+  def self.schedules = @@schedules
+end
+
+# Subclasses Asgard::Base rather than Tasks so `asgard schedule help` lists
+# only these subcommands, not every project task.
+class ScheduleCommands < Asgard::Base
+  namespace "schedule"
+
+  desc "tree", "Print a tree of the schedule subcommands", hide: true
+  def tree = super
+
+  no_commands do
+    def schedules = Tasks.schedules
+
+    def schedule_root = (Asgard.find_task_file&.dirname || Pathname.pwd).to_s
+
+    def schedule_project = File.basename(schedule_root)
+
+    def schedule_label(name) = LaunchdSchedule.label(schedule_project, name)
+
+    def schedule_name(label) = label.delete_prefix(LaunchdSchedule.project_prefix(schedule_project))
+
+    def schedule_domain = "gui/#{Process.uid}"
+
+    def schedule_target(label) = "#{schedule_domain}/#{label}"
+
+    def schedule_plist_path(label) = File.expand_path("~/Library/LaunchAgents/#{label}.plist")
+
+    def schedule_log_path(label) = File.expand_path("~/Library/Logs/asgard/#{label}.log")
+
+    def installed_schedule_labels
+      Dir.glob(schedule_plist_path("#{LaunchdSchedule.project_prefix(schedule_project)}*"))
+         .map { File.basename(it, ".plist") }.sort
+    end
+
+    def declared_schedules
+      abort "No schedules declared. Add `schedule :task, at: \"HH:MM\"` inside class Tasks in #{schedule_root}/.loki." if schedules.empty?
+
+      unknown = schedules.values.map { it[:task] }.uniq - Tasks.all_commands.keys
+      abort "schedule: no such task(s): #{unknown.join(', ')}" unless unknown.empty?
+
+      schedules.values
+    end
+
+    def schedule_direnv
+      return unless File.exist?(File.join(schedule_root, ".envrc"))
+
+      LaunchdSchedule.which("direnv", ENV["PATH"]) or
+        $stderr.puts "schedule: .envrc found but direnv is not on PATH; its variables will not be loaded"
+    end
+
+    def schedule_asgard = LaunchdSchedule.which("asgard", ENV["PATH"]) || abort("schedule: asgard is not on PATH")
+
+    def schedule_plist(spec, asgard:, direnv:)
+      label = schedule_label(spec[:name])
+      LaunchdSchedule.plist(
+        label:,
+        arguments:         LaunchdSchedule.program_arguments(spec[:task], spec[:args], root: schedule_root, asgard:, direnv:),
+        working_directory: schedule_root,
+        environment:       { "PATH" => ENV["PATH"] }.merge(spec[:env]),
+        log_path:          schedule_log_path(label),
+        intervals:         spec[:every] ? nil : LaunchdSchedule.calendar_intervals(at: spec[:at], on: spec[:on]),
+        every:             spec[:every]
+      )
+    end
+
+    def schedule_summary(spec) = "#{LaunchdSchedule.command_line(spec[:task], spec[:args])} (#{LaunchdSchedule.describe(**spec)})"
+
+    def schedule_loaded?(label)
+      system("launchctl", "print", schedule_target(label), out: File::NULL, err: File::NULL)
+    end
+
+    # Stopped entries are launchd-disabled, which persists across logins,
+    # reboots, and reinstalls until `start` enables them again.
+    def schedule_stopped?(label)
+      out, = Open3.capture2("launchctl", "print-disabled", schedule_domain)
+      LaunchdSchedule.disabled_labels(out).include?(label)
+    end
+
+    # bootout returns before the job is fully gone; bootstrapping the same
+    # label too soon fails with "Input/output error", so wait for it.
+    def schedule_unload(label)
+      return unless schedule_loaded?(label)
+
+      system("launchctl", "bootout", schedule_target(label), out: File::NULL, err: File::NULL)
+      20.times do
+        break unless schedule_loaded?(label)
+
+        sleep 0.1
+      end
+    end
+
+    # Writes the plist and (re)loads it, unless the entry is stopped.
+    def schedule_load(spec, asgard:, direnv:)
+      label = schedule_label(spec[:name])
+      path  = schedule_plist_path(label)
+      FileUtils.mkdir_p [File.dirname(path), File.dirname(schedule_log_path(label))]
+      File.write(path, schedule_plist(spec, asgard:, direnv:))
+      sh "plutil -lint -s #{path.shellescape}", silent: true
+      schedule_unload(label)
+      return puts "installed #{label}: #{schedule_summary(spec)} [stopped; `asgard schedule start #{spec[:name]}` to resume]" if schedule_stopped?(label)
+
+      sh "launchctl bootstrap #{schedule_domain} #{path.shellescape}", silent: true
+      puts "installed #{label}: #{schedule_summary(spec)}"
+    end
+
+    # Also clears any stop, so launchd's disabled list doesn't keep it.
+    def schedule_uninstall(label)
+      schedule_unload(label)
+      system("launchctl", "enable", schedule_target(label), out: File::NULL, err: File::NULL)
+      FileUtils.rm_f(schedule_plist_path(label))
+      puts "removed #{label}"
+    end
+  end
+
+  desc "Show the launchd plists install would write, without installing them"
+  def preview
+    asgard = LaunchdSchedule.which("asgard", ENV["PATH"]) || "asgard"
+    direnv = schedule_direnv
+    declared_schedules.each do |spec|
+      puts "# #{schedule_plist_path(schedule_label(spec[:name]))}: #{schedule_summary(spec)}"
+      puts schedule_plist(spec, asgard:, direnv:)
+    end
+  end
+
+  desc "Install this project's schedule declarations as launchd agents (removes undeclared ones)"
+  def install
+    specs  = declared_schedules
+    asgard = schedule_asgard
+    direnv = schedule_direnv
+    wanted = specs.map { schedule_label(it[:name]) }
+
+    (installed_schedule_labels - wanted).each { schedule_uninstall(it) }
+    specs.each { schedule_load(it, asgard:, direnv:) }
+  end
+
+  desc "Show this project's installed launchd agents, their state, and last exit status"
+  def list
+    labels = installed_schedule_labels
+    return puts "No scheduled tasks installed for #{schedule_project}." if labels.empty?
+
+    labels.each do |label|
+      out, ok = Open3.capture2e("launchctl", "print", schedule_target(label))
+      state   = if ok.success? then "active; last exit: #{out[/last exit code = (.+)/, 1] || 'never run'}"
+                elsif schedule_stopped?(label) then "stopped"
+                else "not loaded"
+                end
+      spec    = schedules[schedule_name(label)]
+      timing  = spec ? schedule_summary(spec) : "no longer declared"
+      puts "#{schedule_name(label)}  #{timing}  [#{state}]  log: #{schedule_log_path(label)}"
+    end
+  end
+
+  desc "stop NAME", "Stop one scheduled entry; it stays stopped across reboots and installs until started"
+  def stop(name)
+    label = schedule_label(name)
+    abort "#{name} is not installed (see `asgard schedule list`)." unless installed_schedule_labels.include?(label)
+
+    sh "launchctl disable #{schedule_target(label)}", silent: true
+    schedule_unload(label)
+    puts "stopped #{name}"
+  end
+
+  desc "start NAME", "Start a stopped entry, or install and start just this declared entry"
+  def start(name)
+    label = schedule_label(name)
+    spec  = schedules[name]
+    abort "#{name} is neither declared nor installed (see `asgard schedule list`)." unless spec || installed_schedule_labels.include?(label)
+
+    sh "launchctl enable #{schedule_target(label)}", silent: true
+    if spec
+      declared_schedules # validates the task exists
+      schedule_load(spec, asgard: schedule_asgard, direnv: schedule_direnv)
+    else
+      $stderr.puts "schedule: #{name} is no longer declared; starting its installed plist as-is"
+      schedule_unload(label)
+      sh "launchctl bootstrap #{schedule_domain} #{schedule_plist_path(label).shellescape}", silent: true
+    end
+    puts "started #{name}"
+  end
+
+  desc "trigger NAME", "Run an installed entry now, under launchd's environment"
+  def trigger(name)
+    label = schedule_label(name)
+    abort "#{name} is not installed; run `asgard schedule install` first." unless installed_schedule_labels.include?(label)
+    abort "#{name} is stopped; `asgard schedule start #{name}` first." if schedule_stopped?(label)
+
+    sh "launchctl kickstart -p #{schedule_target(label)}", silent: true
+    puts "started #{label}; output goes to #{schedule_log_path(label)}"
+  end
+
+  desc "log NAME", "Print the named entry's log file to STDOUT"
+  method_option :follow, aliases: "-f", type: :boolean, desc: "Keep printing new output as it arrives (tail -f)"
+  def log(name)
+    label = schedule_label(name)
+    abort "#{name} is neither declared nor installed (see `asgard schedule list`)." unless schedules.key?(name) || installed_schedule_labels.include?(label)
+
+    path = schedule_log_path(label)
+    return $stderr.puts "#{name} has no log yet (#{path}); it is created on the first run." unless File.exist?(path)
+    return sh("tail -n +1 -f #{path.shellescape}", silent: true, exec: true) if options[:follow]
+
+    IO.copy_stream(path, $stdout)
+  end
+
+  desc "Remove all of this project's installed launchd agents"
+  def remove
+    labels = installed_schedule_labels
+    return puts "No scheduled tasks installed for #{schedule_project}." if labels.empty?
+
+    labels.each { schedule_uninstall(it) }
+  end
+end
+
+class Tasks
+  desc "schedule SUBCOMMAND", "Manage launchd schedules declared with `schedule :task, ...`"
+  subcommand "schedule", ScheduleCommands
+end
