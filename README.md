@@ -70,10 +70,11 @@ PASS/FAIL/WARN/SKIP summary. Adding a new gate anywhere is just defining
 another `*_check` task; nothing needs to be redeclared.
 
 Gates defined here: tests, RuboCop, Flog complexity, Flay duplication, Reek
-smells, typos, ERBLint, Fasterer, bundler-audit, and ArchSpec. Each check
-writes its full output to a `*_output.txt` file in the repo being checked and
-prints a one-line summary. Checks whose tool or config is absent report SKIP
-rather than failing; only FAIL blocks. Companion `*_fix` tasks
+smells, typos, ERBLint, Fasterer, SCRAP test structure (scrap4rb),
+bundler-audit, and ArchSpec. Fasterer and SCRAP are advisory: their findings
+report WARN, never FAIL. Each check writes its full output to a `*_output.txt`
+file in the repo being checked and prints a one-line summary. Checks whose
+tool or config is absent report SKIP rather than failing; only FAIL blocks. Companion `*_fix` tasks
 (`rubocop_fix`, `typos_fix`) auto-correct what their checks flag.
 
 ### quality_rails.loki

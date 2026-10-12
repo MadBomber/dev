@@ -242,6 +242,29 @@ class Tasks
     result
   end
 
+  desc "Check Minitest test structure with SCRAP (scrap4rb)"
+  def scrap_check
+    require "shellwords"
+
+    test_files = scrap_test_files
+    return skip_scrap_tests if test_files.empty?
+
+    command =
+      if bundled_gem?("scrap4rb")
+        "bundle exec scrap4rb"
+      elsif command_available?("scrap4rb")
+        "scrap4rb"
+      else
+        return skip_scrap
+      end
+    output = `#{command} #{test_files.shelljoin} 2>&1`
+    File.write("scrap_output.txt", output)
+    result = scrap_result(output, $?.success?)
+    summary = output.lines.find { |l| l =~ /\d+ files?, \d+ tests?/ }&.strip || result.to_s
+    puts "SCRAP: #{summary} (see scrap_output.txt)"
+    result
+  end
+
   desc "Check Gemfile.lock for known vulnerabilities with bundler-audit"
   def bundler_audit_check
     # Prefer the repo's own bin/bundler-audit when it has one -- some apps
@@ -296,6 +319,7 @@ class Tasks
     "flay_check"     => "Flay Duplication",
     "reek_check"     => "Reek Smells",
     "erb_lint_check" => "ERBLint",
+    "scrap_check"    => "SCRAP Test Structure",
     "archspec_check" => "ArchSpec",
   }.freeze
 
@@ -350,6 +374,37 @@ class Tasks
       puts "Bundler Audit: SKIPPED — bundler-audit not found in the bundle or on PATH. " \
         "Install it with `gem install bundler-audit`."
       :skip
+    end
+
+    # Minitest files under test/, in either naming convention. Given a
+    # directory, scrap4rb only globs *_test.rb, so a test_*.rb suite would
+    # silently report 0 files — pass the files explicitly instead.
+    def scrap_test_files
+      Dir.glob(["test/**/*_test.rb", "test/**/test_*.rb"])
+        .reject { |file| File.basename(file) == "test_helper.rb" }
+        .uniq.sort
+    end
+
+    def skip_scrap_tests
+      puts "SCRAP: SKIPPED — no Minitest files (test/**/*_test.rb or test/**/test_*.rb) found."
+      :skip
+    end
+
+    def skip_scrap
+      puts "SCRAP: SKIPPED — scrap4rb not found in the bundle or on PATH. " \
+        "Install it with `gem install scrap4rb`."
+      :skip
+    end
+
+    # scrap4rb exits 0 even when it has advice, so read its totals instead.
+    # Advisory like Fasterer: any non-STABLE file or structure error is a
+    # :warn, never a :fail.
+    def scrap_result(output, succeeded)
+      return :warn unless succeeded
+
+      modes  = output[/^modes:\s+(.*)$/, 1].to_s.split.map { |pair| pair.split("=").first }
+      errors = output[/(\d+) structure errors?/, 1].to_i
+      modes.all?("STABLE") && errors.zero? ? :pass : :warn
     end
 
     def skip_archspec
