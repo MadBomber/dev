@@ -1,0 +1,142 @@
+# linda-crnic/vbr/branch_report.loki
+#
+# Status of every local and remote branch: last activity, ahead/behind the
+# default branch, and merge state — so stale and already-merged branches are
+# easy to spot before cleanup. Read-only; never deletes, pushes, or fetches.
+#
+#   asgard branch_report          # 30-day threshold
+#   asgard branch_report 45       # custom threshold, in days
+
+require "date"
+require "open3"
+
+class Tasks
+  DEFAULT_STALE_DAYS = 30
+
+  helper(:branch_capture) do |*args|
+    out, status = Open3.capture2("git", *args)
+    [out, status.success?]
+  end
+
+  # "origin/main" -> "main". Falls back to whichever of main/master exists
+  # locally when there's no remote (or no origin/HEAD symref) to ask.
+  helper(:branch_default_name) do
+    out, ok = branch_capture("symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    next out.strip.sub(%r{\Aorigin/}, "") if ok && !out.strip.empty?
+
+    locals, = branch_capture("for-each-ref", "refs/heads", "--format=%(refname:short)")
+    %w[main master].find { |name| locals.lines.map(&:strip).include?(name) } || "main"
+  end
+
+  # rev-list/merge-base need a ref that actually resolves: prefer the local
+  # branch of that name (what's usually checked out) and fall back to the
+  # remote-tracking ref when there's no local copy of the default branch.
+  helper(:branch_resolvable_base) do |name|
+    locals, = branch_capture("for-each-ref", "refs/heads", "--format=%(refname:short)")
+    locals.lines.map(&:strip).include?(name) ? name : "origin/#{name}"
+  end
+
+  # One row per ref under prefix: name, last-commit epoch/date, author.
+  # Drops symbolic refs (origin/HEAD) — not a real branch. Its short name
+  # abbreviates to the bare remote name ("origin", not "origin/HEAD"), so
+  # this filters on %(symref) rather than a "/HEAD" suffix match.
+  helper(:branch_rows) do |ref_prefix|
+    fmt = "%(symref)|%(refname:short)|%(committerdate:unix)|%(committerdate:short)|%(authorname)"
+    out, = branch_capture("for-each-ref", ref_prefix, "--format=#{fmt}")
+    out.each_line.filter_map do |line|
+      symref, name, epoch, date, author = line.chomp.split("|", 5)
+      next unless symref.to_s.empty?
+
+      { name: name, epoch: epoch.to_i, date: date, author: author.to_s }
+    end
+  end
+
+  helper(:branch_ahead_behind) do |name, base|
+    out, ok = branch_capture("rev-list", "--left-right", "--count", "#{base}...#{name}")
+    next [nil, nil] unless ok
+
+    behind, ahead = out.strip.split(/\s+/).map(&:to_i)
+    [ahead, behind]
+  end
+
+  helper(:branch_merged?) do |name, base|
+    _, ok = branch_capture("merge-base", "--is-ancestor", name, base)
+    ok
+  end
+
+  desc "Status of every local/remote branch, as Markdown: activity, ahead/behind, merge state vs. the default branch (days: staleness threshold, default #{DEFAULT_STALE_DAYS})"
+  def branch_report(days = DEFAULT_STALE_DAYS)
+    threshold = begin
+      Integer(days)
+    rescue ArgumentError, TypeError
+      abort "branch_report: days must be an integer, got #{days.inspect}"
+    end
+
+    default_name = branch_default_name
+    base = branch_resolvable_base(default_name)
+    now = Time.now.to_i
+
+    current, ok = branch_capture("symbolic-ref", "--short", "HEAD")
+    current = ok ? current.strip : nil
+
+    # A branch flagged "merged" here is only flagged "merged more than N days
+    # ago" using its own last-commit date as a stand-in for the merge date —
+    # finding the actual merge commit for every branch would mean walking
+    # main's full history per branch. Once a branch is merged its tip stops
+    # moving, so the two dates are usually close (exact for a fast-forward or
+    # squash merge, off by however long the PR waited for review otherwise).
+    merged_old = []
+    stale = []
+
+    lines = [
+      "# Branch Report — #{Date.today}",
+      "",
+      "**Default branch:** `#{default_name}` (comparing against `#{base}`; staleness threshold: #{threshold} day(s))",
+      "",
+    ]
+
+    [["Local", "refs/heads"], ["Remote", "refs/remotes"]].each do |label, prefix|
+      rows = branch_rows(prefix).sort_by { |r| r[:epoch] }
+      lines << "## #{label} branches (#{rows.size})"
+      lines << ""
+
+      if rows.empty?
+        lines << "_none_"
+        lines << ""
+        next
+      end
+
+      lines << "| | Name | Last commit | Author | Ahead | Behind | Merged | Days idle |"
+      lines << "|---|---|---|---|---:|---:|:---:|---:|"
+
+      rows.each do |row|
+        idle_days = (now - row[:epoch]) / 86_400
+        ahead, behind = branch_ahead_behind(row[:name], base)
+        merged = branch_merged?(row[:name], base)
+        marker = row[:name] == current ? "→" : ""
+
+        lines << format("| %s | `%s` | %s | %s | %s | %s | %s | %d |",
+                         marker, row[:name], row[:date], row[:author],
+                         ahead.nil? ? "-" : ahead, behind.nil? ? "-" : behind,
+                         merged ? "yes" : "no", idle_days)
+
+        next if row[:name] == default_name
+
+        stale << row.merge(idle_days: idle_days) if idle_days > threshold
+        merged_old << row.merge(idle_days: idle_days) if merged && idle_days > threshold
+      end
+      lines << ""
+    end
+
+    lines << "## Merged more than #{threshold} day(s) ago (#{merged_old.size})"
+    lines << ""
+    lines.concat(merged_old.empty? ? ["_none_"] : merged_old.map { |r| "- `#{r[:name]}` — last commit #{r[:date]}, #{r[:idle_days]}d idle" })
+    lines << ""
+
+    lines << "## No activity for over #{threshold} day(s) (#{stale.size})"
+    lines << ""
+    lines.concat(stale.empty? ? ["_none_"] : stale.map { |r| "- `#{r[:name]}` — last commit #{r[:date]}, #{r[:idle_days]}d idle" })
+
+    puts lines.join("\n")
+  end
+end

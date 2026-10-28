@@ -1,0 +1,334 @@
+# frozen_string_literal: true
+# dev/status_report.loki — end-of-week client status reporting.
+#
+# `daily_summary` collects today's activity from every configured source
+# (each a `*_collect` task, discovered the same way quality.loki discovers
+# `*_check` tasks) into notes/_status/<date>.md under RR. `weekly_report`
+# reads the week's daily files and asks headless Claude Code (`claude -p`)
+# to turn them into a client-facing Markdown report.
+#
+# A day other than today: STATUS_DATE=2026-09-22 asgard daily_summary
+# (collector tasks can't take arguments as asgard dependencies, so the date
+# travels via env var instead of a --date option).
+# A week other than the current one: STATUS_WEEK_OF=2026-09-22 asgard weekly_report
+
+require "date"
+require "fileutils"
+require "json"
+require "net/http"
+require "open3"
+require "base64"
+
+class Tasks
+  COLLECTOR_LABEL_OVERRIDES = { "github" => "GitHub" }.freeze
+
+  no_commands do
+    def status_repo_root = ENV.fetch("RR", Dir.pwd)
+
+    def status_target_date = Date.parse(ENV.fetch("STATUS_DATE", Date.today.to_s))
+
+    def status_dir = File.join(status_repo_root, "notes", "_status")
+
+    def status_day_bounds(date = status_target_date)
+      [date.strftime("%Y-%m-%d 00:00:00"), date.strftime("%Y-%m-%d 23:59:59")]
+    end
+
+    # [stdout, succeeded?] — a missing binary or any other spawn failure
+    # counts the same as a non-zero exit, so callers only branch on `ok`.
+    def safe_capture2(*argv)
+      out, status = Open3.capture2(*argv)
+      [out, status.success?]
+    rescue StandardError
+      ["", false]
+    end
+
+    # Runs a *_collect body, converting any exception into a SKIP instead
+    # of letting it blow up the whole daily_summary dependency graph — a
+    # flaky Jira request or a missing CLI must never abort the other
+    # collectors.
+    def collect(name)
+      yield
+    rescue StandardError => e
+      puts "#{name}: SKIP (#{e.class}: #{e.message})"
+      nil
+    end
+
+    def skip(name, reason)
+      puts "#{name}: SKIP (#{reason})"
+      nil
+    end
+
+    # First human-typed message in a Claude Code session transcript,
+    # trimmed — a rough "what we worked on" label. Deliberately skips
+    # system-reminder/tool-wrapper content that rides along inside a user
+    # turn rather than treating it as something the human said.
+    def claude_session_snippet(path)
+      File.foreach(path) do |line|
+        entry = begin
+          JSON.parse(line)
+        rescue JSON::ParserError
+          next
+        end
+        next unless entry["type"] == "user"
+
+        content = entry.dig("message", "content")
+        text = case content
+               when String then content
+               when Array  then content.find { |c| c["type"] == "text" }&.fetch("text", nil)
+               end
+        next unless text
+
+        text = text.sub(%r{\A<system-reminder>.*?</system-reminder>\s*}m, "").strip
+        next if text.empty?
+        # Anything still starting with "<" is another synthetic wrapper
+        # (<local-command-caveat>, tool-result stand-ins, etc.), not
+        # something the human actually typed — keep scanning.
+        next if text.start_with?("<")
+
+        return text.length > 150 ? "#{text[0, 150].sub(/\s+\S*\z/, "")}…" : text
+      end
+      nil
+    end
+  end
+
+  # ---- collectors -----------------------------------------------------
+  # Each returns nil (nothing to report for the day — puts why) or a
+  # Markdown body with no top-level header; daily_summary supplies
+  # "## <Source>" itself.
+
+  desc "Collect today's _notes.txt journal entries"
+  def notes_collect
+    collect("notes") do
+      path = File.join(status_repo_root, "_notes.txt")
+      next skip("notes", "no _notes.txt at #{path}") unless File.exist?(path)
+
+      wanted = status_target_date.to_s
+      entries = {}
+      current = nil
+      File.foreach(path) do |line|
+        if (m = line.match(/\A--- (\d{4}-\d{2}-\d{2}) \d{2}:\d{2}:\d{2} [+-]\d{4}\s*\z/))
+          current = m[1]
+          entries[current] ||= +""
+        elsif current
+          entries[current] << line
+        end
+      end
+
+      body = entries[wanted]&.strip
+      next skip("notes", "no entries for #{wanted}") if body.nil? || body.empty?
+
+      puts "notes: found today's journal entry"
+      body.lines.map { |l| "> #{l}" }.join
+    end
+  end
+
+  desc "Collect today's git commits authored by you"
+  def git_collect
+    collect("git") do
+      rr = status_repo_root
+      email, ok = safe_capture2("git", "-C", rr, "config", "user.email")
+      email = email.strip
+      next skip("git", "no git user.email configured") unless ok && !email.empty?
+
+      since, until_ts = status_day_bounds
+      log, ok = safe_capture2("git", "-C", rr, "log", "--author=#{email}",
+                               "--since=#{since}", "--until=#{until_ts}",
+                               "--pretty=format:- %h %s")
+      next skip("git", "git log failed") unless ok
+      next skip("git", "no commits for #{status_target_date}") if log.strip.empty?
+
+      puts "git: #{log.lines.size} commit(s)"
+      log.strip
+    end
+  end
+
+  desc "Collect today's GitHub PR/issue activity you were involved in"
+  def github_collect
+    collect("github") do
+      nwo, ok = safe_capture2("gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner")
+      nwo = nwo.strip
+      next skip("github", "gh not available or not a GitHub repo") unless ok && !nwo.empty?
+
+      date = status_target_date.to_s
+      items = { "prs" => "PR", "issues" => "Issue" }.flat_map do |kind, label|
+        out, ok = safe_capture2("gh", "search", kind, "--repo", nwo, "--involves=@me",
+                                 "--updated=#{date}", "--json", "number,title,state", "--limit", "50")
+        next [] unless ok
+
+        parsed = begin
+          JSON.parse(out)
+        rescue JSON::ParserError
+          []
+        end
+        parsed.map { |item| "- #{label} ##{item["number"]}: #{item["title"]} (#{item["state"]})" }
+      end
+
+      next skip("github", "no PR/issue activity for #{date}") if items.empty?
+
+      puts "github: #{items.size} item(s)"
+      items.join("\n")
+    end
+  end
+
+  desc "Collect today's Jira activity in the project"
+  def jira_collect
+    collect("jira") do
+      site, project, email, token = ENV.values_at("JIRA_SITE", "JIRA_PROJECT", "JIRA_USER_EMAIL", "JIRA_API_KEY")
+      if [site, project, email, token].any?(&:nil?)
+        next skip("jira", "JIRA_SITE/PROJECT/USER_EMAIL/API_KEY not fully configured")
+      end
+
+      since, until_ts = status_day_bounds
+      jql = %(project = #{project} AND updated >= "#{since[0, 16]}" AND updated <= "#{until_ts[0, 16]}" ORDER BY updated DESC)
+
+      # Atlassian deprecated /rest/api/3/search (returns HTTP 410) in favor
+      # of /rest/api/3/search/jql — see
+      # https://developer.atlassian.com/changelog/#CHANGE-2046
+      uri = URI("#{site}/rest/api/3/search/jql")
+      uri.query = URI.encode_www_form(jql: jql, fields: "summary,status,assignee")
+
+      req = Net::HTTP::Get.new(uri)
+      req["Authorization"] = "Basic #{Base64.strict_encode64("#{email}:#{token}")}"
+      req["Accept"] = "application/json"
+      response = Net::HTTP.start(uri.host, uri.port, use_ssl: true) { |http| http.request(req) }
+
+      next skip("jira", "HTTP #{response.code}") unless response.is_a?(Net::HTTPSuccess)
+
+      issues = JSON.parse(response.body)["issues"] || []
+      next skip("jira", "no #{project} activity for #{status_target_date}") if issues.empty?
+
+      puts "jira: #{issues.size} issue(s)"
+      issues.map do |issue|
+        fields = issue["fields"]
+        assignee = fields.dig("assignee", "displayName") || "unassigned"
+        "- #{issue["key"]}: #{fields["summary"]} (#{fields.dig("status", "name")}, #{assignee})"
+      end.join("\n")
+    end
+  end
+
+  desc "Collect today's Claude Code session activity for this project"
+  def claude_sessions_collect
+    collect("claude_sessions") do
+      dir = File.join(Dir.home, ".claude", "projects", status_repo_root.gsub(%r{[/_]}, "-"))
+      next skip("claude_sessions", "no session directory at #{dir}") unless Dir.exist?(dir)
+
+      date = status_target_date
+      files = Dir.glob(File.join(dir, "*.jsonl")).select { |f| File.mtime(f).to_date == date }
+      next skip("claude_sessions", "no sessions modified on #{date}") if files.empty?
+
+      snippets = files.filter_map { |f| claude_session_snippet(f) }
+      next skip("claude_sessions", "sessions found but no readable user messages") if snippets.empty?
+
+      puts "claude_sessions: #{snippets.size} session(s)"
+      snippets.map { |s| "- #{s}" }.join("\n")
+    end
+  end
+
+  desc "Collect today's shell commands (requires HISTTIMEFORMAT)"
+  def shell_history_collect
+    collect("shell_history") do
+      path = File.join(Dir.home, ".bash_history")
+      next skip("shell_history", "no #{path}") unless File.exist?(path)
+
+      date = status_target_date.to_s
+      secret_pattern = /(_KEY|_TOKEN|_SECRET|PASSWORD)\s*=/i
+      noisy = %w[cd ls ll clear pwd history]
+
+      lines = File.readlines(path, chomp: true)
+                  .select { |l| l.start_with?(date) }
+                  .reject { |l| secret_pattern.match?(l) }
+                  .filter_map do |l|
+                    cmd = l.sub(/\A\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s+/, "").strip
+                    next nil if cmd.empty? || noisy.include?(cmd)
+
+                    "- `#{cmd}`"
+                  end
+
+      next skip("shell_history", "no timestamped commands for #{date} (is HISTTIMEFORMAT set?)") if lines.empty?
+
+      puts "shell_history: #{lines.size} command(s)"
+      lines.join("\n")
+    end
+  end
+
+  desc "Collect the target date's calendar events"
+  def calendar_collect
+    collect("calendar") do
+      date = status_target_date
+      tz = Time.now.strftime("%z")
+      from = "eventsFrom:#{date} 00:00:00 #{tz}"
+      to = "to:#{date} 23:59:59 #{tz}"
+
+      out, ok = safe_capture2("icalBuddy", "-nc", "-eep", "location,notes,url",
+                               "-po", "title,datetime,attendees", from, to)
+      next skip("calendar", "icalBuddy not available (brew install ical-buddy)") unless ok
+      next skip("calendar", "no events for #{date}") if out.strip.empty?
+
+      puts "calendar: events found"
+      out.strip
+    end
+  end
+
+  # ---- orchestration ----------------------------------------------------
+
+  desc "Collect today's activity from every configured source into notes/_status/<date>.md"
+  depends_on -> { [all_commands.keys.grep(/_collect\z/).sort.map(&:to_sym)] }
+  def daily_summary
+    date = status_target_date
+    collect_tasks = self.class._deps.fetch(:daily_summary, []).flatten.map(&:to_s)
+
+    sections = collect_tasks.filter_map do |name|
+      body = dep_result(name)
+      next if body.nil? || body.to_s.strip.empty?
+
+      base = name.sub(/_collect\z/, "")
+      label = COLLECTOR_LABEL_OVERRIDES[base] || base.split("_").map(&:capitalize).join(" ")
+      "## #{label}\n\n#{body}"
+    end
+
+    FileUtils.mkdir_p(status_dir)
+    out_path = File.join(status_dir, "#{date}.md")
+    body = sections.empty? ? "_No activity captured today._" : sections.join("\n\n")
+    File.write(out_path, "# #{date}\n\n#{body}\n")
+    puts "Wrote #{out_path} (#{sections.size}/#{collect_tasks.size} source(s) had activity)"
+  end
+
+  desc "Assemble the week's daily summaries into a client status report via Claude"
+  def weekly_report
+    today = Date.today
+    monday = ENV.key?("STATUS_WEEK_OF") ? Date.parse(ENV["STATUS_WEEK_OF"]) : today - ((today.wday + 6) % 7)
+    week_files = (0..4).map { |i| File.join(status_dir, "#{monday + i}.md") }.select { |f| File.exist?(f) }
+
+    abort "weekly_report: no daily summaries found for the week of #{monday}. Run daily_summary each day first." if week_files.empty?
+
+    raw = week_files.map { |f| File.read(f) }.join("\n\n---\n\n")
+
+    prompt = <<~PROMPT
+      You are drafting a Friday end-of-week status report for a consulting client, from a
+      contractor's raw daily activity logs below (one per weekday, collected automatically
+      from git, GitHub, Jira, personal notes, Claude Code sessions, shell history, and
+      calendar). Turn this into a finished, client-facing Markdown report:
+
+      - Short, plain-spoken lead-in paragraph, not corporate-sounding.
+      - A bulleted body grouped by theme (not by source) — e.g. access/setup, code review,
+        Jira/spec work, tooling/docs, meetings — dropping anything that's just noise
+        (routine commands, empty sections).
+      - Call out any deadlines, blockers, or priority decisions explicitly.
+      - Sign off simply, first name only.
+
+      Raw week:
+
+      #{raw}
+    PROMPT
+
+    # Drop ANTHROPIC_API_KEY for this child process only: `claude -p`
+    # prefers it over the CLI's own OAuth login, and a stray/expired key
+    # elsewhere in the shell environment must not break this task's auth.
+    stdout, status = Open3.capture2({ "ANTHROPIC_API_KEY" => nil }, "claude", "-p", prompt)
+    abort "weekly_report: claude -p failed (exit #{status.exitstatus}) — is `claude` logged in? Try `claude` interactively once, or `claude /login`." unless status.success?
+
+    out_path = File.join(status_dir, "week-of-#{monday}.md")
+    File.write(out_path, stdout)
+    puts "Wrote #{out_path} — review before sending."
+  end
+end

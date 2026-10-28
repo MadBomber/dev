@@ -61,19 +61,32 @@ class Tasks
   end
 
   desc "Check code complexity with Flog (warn >=20, fail >=50)"
+  # Runs flog in a subprocess rather than `require "flog"` in this process:
+  # flay (in-process) activates the prism default gem (2.x on Ruby 4), and
+  # flog 4.9 pins prism ~> 1.7, so whichever gate loaded first used to win and
+  # the other raised Gem::ConflictError. A subprocess lets the project's bundle
+  # (or the global flog when the project does not bundle it) pick its own prism.
   def flog_check
-    require "flog"
-
     method_warn = 20.0
     method_fail = 50.0
 
-    flogger = Flog.new(all: true)
-    flogger.flog(*quality_source_files)
+    flog   = bundled_gem?("flog") ? "bundle exec flog" : "flog"
+    output = `#{flog} --all --methods-only --quiet #{@@quality_dirs.join(' ')} 2>&1`
+    unless $?.success?
+      File.write("flog_output.txt", output)
+      puts "Flog: failed to run (see flog_output.txt)"
+      return :fail
+    end
 
     warnings = []
     failures = []
 
-    flogger.each_by_score do |method_name, score|
+    # "   99.8: Pgdd::Report#table_page   lib/pgdd/report.rb:214-249"; the
+    # "flog total" and "flog/method average" lines carry no class or method
+    output.each_line do |line|
+      next unless (m = line.match(/\A\s*(\d+(?:\.\d+)?):\s+(\S+)\s+\S+/))
+      score, method_name = m[1].to_f, m[2]
+      next unless method_name.include?("#") || method_name.include?("::")
       next if method_name.end_with?("#none")
       if score > method_fail
         failures << "#{"%.1f" % score}: #{method_name}"
