@@ -112,10 +112,8 @@ be redeclared.
 Scheduling is built into asgard (0.4.0 and later): declare
 `schedule :task, at: "17:30", on: :weekdays` in a `.loki` and manage the
 entries with `asgard schedule`. See
-[Scheduled Tasks](https://madbomber.github.io/asgard/schedule/). This repo's
-old `schedule.loki` was removed; delete any `import_up "dev/schedule.loki"`
-line, since that file overrides the built-in `schedule` and no longer loads
-under asgard 0.6.0.
+[Scheduled Tasks](https://madbomber.github.io/asgard/schedule/). If your
+`.loki` still has `import_up "dev/schedule.loki"`, delete it.
 
 ### rubocop-strict.yml
 
