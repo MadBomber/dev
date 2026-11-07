@@ -109,17 +109,24 @@ be redeclared.
 
 ### Scheduled tasks
 
-Scheduling is built into asgard (0.4.0 and later): declare
+Scheduling is built into asgard: declare
 `schedule :task, at: "17:30", on: :weekdays` in a `.loki` and manage the
 entries with `asgard schedule`. See
-[Scheduled Tasks](https://madbomber.github.io/asgard/schedule/). If your
-`.loki` still has `import_up "dev/schedule.loki"`, delete it, then run
-`asgard schedule install`. That file loaded ActiveSupport and asgard does
-not, so write `every: 3600` instead of `every: 1.hour` (or require
-`active_support/core_ext/integer/time` yourself). Moving to asgard 0.6.0
-with jobs already installed? Read its
-[Breaking Changes](https://madbomber.github.io/asgard/breaking-changes/)
-first.
+[Scheduled Tasks](https://madbomber.github.io/asgard/schedule/).
+
+The old `dev/schedule.loki` is gone; it no longer loads under asgard 0.6.0.
+To move a repo off it (these steps assume asgard 0.6.0):
+
+1. Remove the jobs it installed. They are filed under the plain project
+   name, which 0.6.0 does not treat as this project's: find them with
+   `asgard schedule list --all` and run
+   `asgard schedule remove <project>/<name>` for each.
+2. Delete `import_up "dev/schedule.loki"` from the `.loki`.
+3. Fix declarations the built-in `schedule` reads differently. It does not
+   load ActiveSupport, so write `every: 3600`, not `every: 1.hour`; it
+   rejects `every:` with `on:`; and entry names built from `options:` may
+   gain a hash suffix. asgard's CHANGELOG lists the details.
+4. Run `asgard schedule install`.
 
 ### rubocop-strict.yml
 
