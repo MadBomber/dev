@@ -45,7 +45,6 @@ whose `push` also pushes tags).
 | `doc_tasks.loki` | Documentation tasks (`tocer`, `mkdocs` build/serve), enabled per repo |
 | `status_report.loki` | End-of-week client status reporting: `daily_summary`, `weekly_report` |
 | `iterm_tasks.loki` | Terminal fixes: `half_duplex_screen_fix`, `clear_scroll_back_buffer` |
-| `schedule.loki` | Scheduled tasks via launchd (macOS) or systemd (Linux): `schedule` helper plus `asgard schedule preview|install|list|start|stop|trigger|log|remove` |
 | `rubocop-strict.yml` | Cops that must always fire, regardless of `.rubocop_todo.yml` or inline directives |
 
 ### gem_tasks.loki
@@ -108,66 +107,30 @@ unset env var just prints a SKIP line instead of aborting the others:
 Add a source by defining another `*_collect` task; nothing else needs to
 be redeclared.
 
-### schedule.loki
+### Scheduled tasks
 
-Runs asgard tasks on a schedule, declared right in the repo's own `.loki`,
-using the platform's own scheduler: **launchd** on macOS, **systemd user
-timers** on Linux. Both run a calendar job missed while the machine slept as
-soon as it wakes. Needs the `activesupport` gem installed (for
-`every: 3.minutes`-style durations).
+Scheduling is built into asgard: declare
+`schedule :task, at: "17:30", on: :weekdays` in a `.loki` and manage the
+entries with `asgard schedule`. See
+[Scheduled Tasks](https://madbomber.github.io/asgard/schedule/).
 
-```ruby
-# .loki
-import_up "dev/schedule.loki"
+The old `dev/schedule.loki` has been removed. To move a repo off it (these
+steps assume asgard 0.6.0):
 
-class Tasks
-  schedule :daily_summary, at: "17:30", on: :weekdays
-  schedule :weekly_report, at: "16:00", on: :friday
-  schedule :sync,          every: 1.hour               # or plain seconds: 3600
-
-  # The task's own flags go in options: (split shell-style, quotes kept)
-  schedule :report, options: "-v",                                at: "08:00", on: :weekdays
-  schedule :report, options: "--period week --title 'Week End'", at: "16:30", on: :friday, as: "weekly_report"
-end
-```
-
-`on:` takes `:daily` (default), `:weekdays`, `:weekends`, a day, or an array
-of days; `at:` may be an array of times; `options:` may also be an array of
-words; `env:` adds literal variables. Each entry has a name, used by the
-subcommands below: the task name, a slug of the task plus its options
-(`:report, options: "-v"` → `report-v`), or whatever `as:` gives. So one
-task can be scheduled several times with different flags; two different
-entries with the same name raise.
-
-`schedule` is also a command with subcommands (same on both platforms):
-
-- `asgard schedule preview` — prints the job files that would be installed
-- `asgard schedule install` — writes and loads one job per declaration; removes jobs no longer declared
-- `asgard schedule list` — installed entries, their command, schedule, state (active/stopped), and last exit status
-- `asgard schedule stop NAME` — stops one entry; it stays stopped across reboots and `install` until started
-- `asgard schedule start NAME` — starts a stopped entry, or installs and starts just that declared entry
-- `asgard schedule trigger NAME` — runs an installed entry now, under the scheduler's environment
-- `asgard schedule log NAME` — prints the entry's log to STDOUT; `-f` keeps following it
-- `asgard schedule remove` — unloads and deletes all of this project's jobs
-
-Jobs run `asgard <task> [options]` from the directory holding `.loki` with the
-PATH captured at install time. If the repo has a `.envrc`, jobs run under
-`direnv exec` so `RR`, API keys, etc. load at run time and never land in the
-job files. Re-run `asgard schedule install` after changing declarations or
-your PATH.
-
-| | macOS (launchd) | Linux (systemd) |
-|---|---|---|
-| Job files | `~/Library/LaunchAgents/com.madbomber.asgard.<project>.<name>.plist` | `~/.config/systemd/user/asgard.<project>.<name>.{service,timer}` |
-| Logs | `~/Library/Logs/asgard/` | `~/.local/state/asgard/` |
-| Stop | `launchctl disable` | `systemctl --user disable --now` |
-| Caveat | runs only while you're logged in | runs only while you're logged in unless `loginctl enable-linger`; needs systemd 240+ |
-
-Code layout: `lib/schedule_declaration.rb` (declarations, platform-neutral,
-and the backend API both platforms implement), `lib/launchd_schedule.rb`
-(macOS only), `lib/systemd_schedule.rb` (Linux only). Tests:
-`ruby test/<name>_test.rb` for each; both backends' tests run on any
-platform because system commands go through an injectable runner.
+1. Fix declarations the built-in `schedule` reads differently, so the
+   `.loki` will load without the old file. `every: 1.hour` raises unless the `.loki` requires
+   `active_support/core_ext/integer/time` itself (or write `every: 3600`);
+   `every:` with `on:` is rejected; and entry names built from `options:`
+   may gain a hash suffix (pass `as:` to keep a fixed name). asgard's
+   CHANGELOG lists the details.
+2. Delete `import_up "dev/schedule.loki"` from the `.loki`.
+3. Remove the jobs the old file installed. They are filed under the plain
+   project name, which 0.6.0 does not treat as this project's: find them
+   with `asgard schedule list --all` and run
+   `asgard schedule remove <project>/<name>` for each
+   (`asgard schedule prune` clears any whose directory is gone). Do this in
+   every such repo before step 4 in any of them.
+4. Run `asgard schedule install`.
 
 ### rubocop-strict.yml
 
