@@ -118,7 +118,7 @@ The old `dev/schedule.loki` has been removed. To move a repo off it (these
 steps assume asgard 0.6.0):
 
 1. Fix declarations the built-in `schedule` reads differently, so the
-   `.loki` loads. `every: 1.hour` raises unless the `.loki` requires
+   `.loki` will load without the old file. `every: 1.hour` raises unless the `.loki` requires
    `active_support/core_ext/integer/time` itself (or write `every: 3600`);
    `every:` with `on:` is rejected; and entry names built from `options:`
    may gain a hash suffix (pass `as:` to keep a fixed name). asgard's
