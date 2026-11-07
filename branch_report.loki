@@ -29,8 +29,9 @@ class Tasks
   end
 
   # rev-list/merge-base need a ref that actually resolves: prefer origin's
-  # copy, so a branch merged on the server reads as merged after a fetch
-  # (no pull needed) and the local default row shows how far it has drifted.
+  # copy, so a branch merged on the server reads as merged once fetched
+  # (no pull needed; this task never fetches), and the local default row
+  # shows how far it has drifted.
   # Falls back to the local branch when origin has no such ref.
   helper(:branch_resolvable_base) do |name|
     _, ok = branch_capture("rev-parse", "--verify", "--quiet", "refs/remotes/origin/#{name}")
