@@ -51,9 +51,8 @@ class Tasks
     end
   end
 
-  # The default branch and its remote-tracking copy ("main", "origin/main")
-  # are the baseline every other branch is measured against, so neither
-  # belongs in the merged or idle lists.
+  # The baseline itself, local or remote ("main", "origin/main"), is never
+  # listed as merged or idle.
   helper(:branch_default?) do |name, default_name|
     [default_name, "origin/#{default_name}"].include?(name)
   end
