@@ -114,18 +114,22 @@ Scheduling is built into asgard: declare
 entries with `asgard schedule`. See
 [Scheduled Tasks](https://madbomber.github.io/asgard/schedule/).
 
-The old `dev/schedule.loki` is gone; it no longer loads under asgard 0.6.0.
-To move a repo off it (these steps assume asgard 0.6.0):
+The old `dev/schedule.loki` has been removed. To move a repo off it (these
+steps assume asgard 0.6.0):
 
-1. Remove the jobs it installed. They are filed under the plain project
-   name, which 0.6.0 does not treat as this project's: find them with
-   `asgard schedule list --all` and run
-   `asgard schedule remove <project>/<name>` for each.
+1. Fix declarations the built-in `schedule` reads differently, so the
+   `.loki` loads. `every: 1.hour` raises unless the `.loki` requires
+   `active_support/core_ext/integer/time` itself (or write `every: 3600`);
+   `every:` with `on:` is rejected; and entry names built from `options:`
+   may gain a hash suffix (pass `as:` to keep a fixed name). asgard's
+   CHANGELOG lists the details.
 2. Delete `import_up "dev/schedule.loki"` from the `.loki`.
-3. Fix declarations the built-in `schedule` reads differently. It does not
-   load ActiveSupport, so write `every: 3600`, not `every: 1.hour`; it
-   rejects `every:` with `on:`; and entry names built from `options:` may
-   gain a hash suffix. asgard's CHANGELOG lists the details.
+3. Remove the jobs the old file installed. They are filed under the plain
+   project name, which 0.6.0 does not treat as this project's: find them
+   with `asgard schedule list --all` and run
+   `asgard schedule remove <project>/<name>` for each
+   (`asgard schedule prune` clears any whose directory is gone). Do this in
+   every such repo before step 4 in any of them.
 4. Run `asgard schedule install`.
 
 ### rubocop-strict.yml
