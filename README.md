@@ -42,9 +42,11 @@ whose `push` also pushes tags).
 | `quality.loki` | The `quality` gate and the `*_check` tasks it runs |
 | `quality_rails.loki` | Rails-only checks: Brakeman, RailsBestPractices, ActiveRecordDoctor |
 | `git.loki` | Per-repo git basics: `push`, `pull` (ff-only), `fetch` |
-| `doc_tasks.loki` | Documentation tasks (`tocer`, `mkdocs` build/serve), enabled per repo |
+| `doc_tasks.loki` | Documentation site tasks for MkDocs or Bridgetown: `doc install`, `doc build`, `doc serve` (a background job), `doc open` |
 | `status_report.loki` | End-of-week client status reporting: `daily_summary`, `weekly_report` |
 | `iterm_tasks.loki` | Terminal fixes: `half_duplex_screen_fix`, `clear_scroll_back_buffer` |
+| `branch_report.loki` | `branch_report [DAYS]`: read-only Markdown report of every local and remote branch (last commit, ahead/behind and merged vs. the default branch, idle more than DAYS, default 30) |
+| `db_doc.loki` | [tbls](https://github.com/k1LoW/tbls) schema docs from a local Postgres into `notes/dbdoc`: `db_doc`, `db_doc_diff`, `db_doc_mermaid`, `db_doc_open`, `db_doc_clean` (set `DB_DOC_DSN` to change the database) |
 | `rubocop-strict.yml` | Cops that must always fire, regardless of `.rubocop_todo.yml` or inline directives |
 
 ### gem_tasks.loki
