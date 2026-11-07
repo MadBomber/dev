@@ -113,7 +113,13 @@ Scheduling is built into asgard (0.4.0 and later): declare
 `schedule :task, at: "17:30", on: :weekdays` in a `.loki` and manage the
 entries with `asgard schedule`. See
 [Scheduled Tasks](https://madbomber.github.io/asgard/schedule/). If your
-`.loki` still has `import_up "dev/schedule.loki"`, delete it.
+`.loki` still has `import_up "dev/schedule.loki"`, delete it, then run
+`asgard schedule install`. That file loaded ActiveSupport and asgard does
+not, so write `every: 3600` instead of `every: 1.hour` (or require
+`active_support/core_ext/integer/time` yourself). Moving to asgard 0.6.0
+with jobs already installed? Read its
+[Breaking Changes](https://madbomber.github.io/asgard/breaking-changes/)
+first.
 
 ### rubocop-strict.yml
 
