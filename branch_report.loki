@@ -51,6 +51,12 @@ class Tasks
     end
   end
 
+  # The baseline itself, local or remote ("main", "origin/main"), is never
+  # listed as merged or idle.
+  helper(:branch_default?) do |name, default_name|
+    [default_name, "origin/#{default_name}"].include?(name)
+  end
+
   helper(:branch_ahead_behind) do |name, base|
     out, ok = branch_capture("rev-list", "--left-right", "--count", "#{base}...#{name}")
     next [nil, nil] unless ok
@@ -120,7 +126,7 @@ class Tasks
                          ahead.nil? ? "-" : ahead, behind.nil? ? "-" : behind,
                          merged ? "yes" : "no", idle_days)
 
-        next if row[:name] == default_name
+        next if branch_default?(row[:name], default_name)
 
         stale << row.merge(idle_days: idle_days) if idle_days > threshold
         merged_old << row.merge(idle_days: idle_days) if merged && idle_days > threshold
