@@ -45,7 +45,7 @@ whose `push` also pushes tags).
 | `doc_tasks.loki` | Documentation site tasks, for a repo with `mkdocs.yml` or `bridgetown.config.yml`: `doc install`, `doc build`, `doc serve`, `doc open` |
 | `status_report.loki` | End-of-week client status reporting: `daily_summary`, `weekly_report` |
 | `iterm_tasks.loki` | Terminal fixes: `half_duplex_screen_fix`, `clear_scroll_back_buffer` |
-| `branch_report.loki` | `branch_report [DAYS]`: read-only table of every local and remote branch, then the ones idle (or merged and idle) over DAYS, default 30 |
+| `branch_report.loki` | `branch_report [DAYS]`: read-only table of every local and remote branch (ahead/behind and merged measured against `origin/<default>` as of the last fetch, else the local default), then the ones idle (or merged and idle) over DAYS, default 30 |
 | `db_doc.loki` | [tbls](https://github.com/k1LoW/tbls) schema docs into `notes/dbdoc` (needs Postgres up on localhost:5432; `DB_DOC_DSN` overrides the default vbr_development DSN): `db_doc`, `db_doc_diff`, `db_doc_mermaid`, `db_doc_open`, `db_doc_clean` |
 | `rubocop-strict.yml` | Cops that must always fire, regardless of `.rubocop_todo.yml` or inline directives |
 

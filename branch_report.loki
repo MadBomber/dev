@@ -28,12 +28,14 @@ class Tasks
     %w[main master].find { |name| locals.lines.map(&:strip).include?(name) } || "main"
   end
 
-  # rev-list/merge-base need a ref that actually resolves: prefer the local
-  # branch of that name (what's usually checked out) and fall back to the
-  # remote-tracking ref when there's no local copy of the default branch.
+  # rev-list/merge-base need a ref that actually resolves: prefer origin's
+  # copy, so a branch merged on the server reads as merged once fetched
+  # (no pull needed; this task never fetches), and the local default row
+  # shows how far it has drifted.
+  # Falls back to the local branch when origin has no such ref.
   helper(:branch_resolvable_base) do |name|
-    locals, = branch_capture("for-each-ref", "refs/heads", "--format=%(refname:short)")
-    locals.lines.map(&:strip).include?(name) ? name : "origin/#{name}"
+    _, ok = branch_capture("rev-parse", "--verify", "--quiet", "refs/remotes/origin/#{name}")
+    ok ? "origin/#{name}" : name
   end
 
   # One row per ref under prefix: name, last-commit epoch/date, author.
@@ -51,8 +53,8 @@ class Tasks
     end
   end
 
-  # The baseline itself, local or remote ("main", "origin/main"), is never
-  # listed as merged or idle.
+  # The default branch itself, local or remote ("main", "origin/main"), is
+  # never listed as merged or idle.
   helper(:branch_default?) do |name, default_name|
     [default_name, "origin/#{default_name}"].include?(name)
   end
