@@ -36,6 +36,14 @@ class Tasks
     locals.lines.map(&:strip).include?(name) ? name : "origin/#{name}"
   end
 
+  # Remote rows compare against origin's copy of the default branch, so a
+  # branch merged on the server reads as merged before the local default is
+  # pulled. Falls back to local_base when origin has no such branch.
+  helper(:branch_remote_base) do |name, local_base|
+    _, ok = branch_capture("rev-parse", "--verify", "--quiet", "refs/remotes/origin/#{name}")
+    ok ? "origin/#{name}" : local_base
+  end
+
   # One row per ref under prefix: name, last-commit epoch/date, author.
   # Drops symbolic refs (origin/HEAD) — not a real branch. Its short name
   # abbreviates to the bare remote name ("origin", not "origin/HEAD"), so
@@ -80,6 +88,7 @@ class Tasks
 
     default_name = branch_default_name
     base = branch_resolvable_base(default_name)
+    remote_base = branch_remote_base(default_name, base)
     now = Time.now.to_i
 
     current, ok = branch_capture("symbolic-ref", "--short", "HEAD")
@@ -97,11 +106,11 @@ class Tasks
     lines = [
       "# Branch Report — #{Date.today}",
       "",
-      "**Default branch:** `#{default_name}` (comparing against `#{base}`; staleness threshold: #{threshold} day(s))",
+      "**Default branch:** `#{default_name}` (local branches compared against `#{base}`, remote branches against `#{remote_base}`; staleness threshold: #{threshold} day(s))",
       "",
     ]
 
-    [["Local", "refs/heads"], ["Remote", "refs/remotes"]].each do |label, prefix|
+    [["Local", "refs/heads", base], ["Remote", "refs/remotes", remote_base]].each do |label, prefix, row_base|
       rows = branch_rows(prefix).sort_by { |r| r[:epoch] }
       lines << "## #{label} branches (#{rows.size})"
       lines << ""
@@ -117,8 +126,8 @@ class Tasks
 
       rows.each do |row|
         idle_days = (now - row[:epoch]) / 86_400
-        ahead, behind = branch_ahead_behind(row[:name], base)
-        merged = branch_merged?(row[:name], base)
+        ahead, behind = branch_ahead_behind(row[:name], row_base)
+        merged = branch_merged?(row[:name], row_base)
         marker = row[:name] == current ? "→" : ""
 
         lines << format("| %s | `%s` | %s | %s | %s | %s | %s | %d |",
