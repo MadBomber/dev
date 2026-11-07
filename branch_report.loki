@@ -53,8 +53,8 @@ class Tasks
     end
   end
 
-  # The baseline itself, local or remote ("main", "origin/main"), is never
-  # listed as merged or idle.
+  # The default branch itself, local or remote ("main", "origin/main"), is
+  # never listed as merged or idle.
   helper(:branch_default?) do |name, default_name|
     [default_name, "origin/#{default_name}"].include?(name)
   end
