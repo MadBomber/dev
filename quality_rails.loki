@@ -21,6 +21,8 @@
 class Tasks
   desc "Check for Rails security vulnerabilities with Brakeman"
   def brakeman_check
+    return skip_brakeman unless bundled_gem?("brakeman")
+
     output = `bundle exec brakeman -q 2>&1`
     result = $?.success? ? :pass : :fail
     File.write("brakeman_output.txt", output)
@@ -31,6 +33,8 @@ class Tasks
 
   desc "Check for Rails anti-patterns with RailsBestPractices"
   def rails_best_practices_check
+    return skip_rails_best_practices unless bundled_gem?("rails_best_practices")
+
     output = `bundle exec rails_best_practices --silent --without-color . 2>&1`
     result = $?.success? ? :pass : :fail
     File.write("rails_best_practices_output.txt", output)
@@ -41,6 +45,8 @@ class Tasks
 
   desc "Check for database schema issues with ActiveRecordDoctor"
   def active_record_doctor_check
+    return skip_active_record_doctor unless bundled_gem?("active_record_doctor")
+
     output = `bundle exec rake active_record_doctor 2>&1`
     result = $?.success? ? :pass : :fail
     File.write("active_record_doctor_output.txt", output)
@@ -48,5 +54,25 @@ class Tasks
     summary = result == :pass ? "no issues found" : "#{issue_count} issue line(s) found"
     puts "ActiveRecordDoctor: #{summary} (see active_record_doctor_output.txt)"
     result
+  end
+
+  no_commands do
+    def skip_brakeman
+      puts "Brakeman: SKIPPED — brakeman is not in this repo's bundle. " \
+        "Add it to the Gemfile's development group to enable this gate."
+      :skip
+    end
+
+    def skip_rails_best_practices
+      puts "RailsBestPractices: SKIPPED — rails_best_practices is not in this repo's bundle. " \
+        "Add it to the Gemfile's development group to enable this gate."
+      :skip
+    end
+
+    def skip_active_record_doctor
+      puts "ActiveRecordDoctor: SKIPPED — active_record_doctor is not in this repo's bundle. " \
+        "Add it to the Gemfile's development group to enable this gate."
+      :skip
+    end
   end
 end

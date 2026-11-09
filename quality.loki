@@ -247,6 +247,8 @@ class Tasks
 
   desc "Check for performance suggestions with Fasterer"
   def fasterer_check
+    return skip_fasterer unless bundled_gem?("fasterer")
+
     output = `bundle exec fasterer #{@@quality_dirs.join(' ')} 2>&1`.gsub(/\e\[\d+m/, "")
     result = $?.success? ? :pass : :warn
     File.write("fasterer_output.txt", output)
@@ -424,6 +426,12 @@ class Tasks
       reason = command_available?("archspec") ? "no Archspec.rb found" : "`archspec` command not found"
       puts "ArchSpec: SKIPPED — #{reason}. Install it with `gem install archspec` " \
         "and run `archspec init` to generate one."
+      :skip
+    end
+
+    def skip_fasterer
+      puts "Fasterer: SKIPPED — fasterer is not in this repo's bundle. " \
+        "Add it to the Gemfile's development group to enable this gate."
       :skip
     end
 
