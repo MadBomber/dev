@@ -17,7 +17,6 @@ require "fileutils"
 require "json"
 require "net/http"
 require "open3"
-require "base64"
 
 class Tasks
   COLLECTOR_LABEL_OVERRIDES = { "github" => "GitHub" }.freeze
@@ -188,7 +187,7 @@ class Tasks
       uri.query = URI.encode_www_form(jql: jql, fields: "summary,status,assignee")
 
       req = Net::HTTP::Get.new(uri)
-      req["Authorization"] = "Basic #{Base64.strict_encode64("#{email}:#{token}")}"
+      req["Authorization"] = "Basic #{["#{email}:#{token}"].pack('m0')}"
       req["Accept"] = "application/json"
       response = Net::HTTP.start(uri.host, uri.port, use_ssl: true) { |http| http.request(req) }
 
@@ -324,7 +323,11 @@ class Tasks
     # Drop ANTHROPIC_API_KEY for this child process only: `claude -p`
     # prefers it over the CLI's own OAuth login, and a stray/expired key
     # elsewhere in the shell environment must not break this task's auth.
-    stdout, status = Open3.capture2({ "ANTHROPIC_API_KEY" => nil }, "claude", "-p", prompt)
+    stdout, status = begin
+      Open3.capture2({ "ANTHROPIC_API_KEY" => nil }, "claude", "-p", prompt)
+    rescue Errno::ENOENT
+      abort "weekly_report: `claude` not found on PATH. Install the Claude CLI (https://docs.claude.com/claude-code) and run `claude /login` once."
+    end
     abort "weekly_report: claude -p failed (exit #{status.exitstatus}) — is `claude` logged in? Try `claude` interactively once, or `claude /login`." unless status.success?
 
     out_path = File.join(status_dir, "week-of-#{monday}.md")
