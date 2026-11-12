@@ -71,9 +71,12 @@ class Tasks
     method_fail = 50.0
 
     flog =
-      if bundled_gem?("flog") then "bundle exec flog"
-      elsif command_available?("flog") then "flog"
-      else return skip_flog
+      if bundled_gem?("flog")
+        "bundle exec flog"
+      elsif command_available?("flog")
+        "flog"
+      else
+        return skip_flog
       end
     output = `#{flog} --all --methods-only --quiet #{@@quality_dirs.join(' ')} 2>&1`
     unless $?.success?
@@ -381,11 +384,15 @@ class Tasks
     end
 
     # true when +lib+ can be required into asgard's own Ruby (flay and
-    # reek run in-process, so the gem must be installed there).
+    # reek run in-process, so the gem must be installed there). Only the
+    # gem itself being absent counts: a LoadError from inside an installed
+    # gem, or a Gem::ConflictError, is re-raised so the gate fails loudly.
     def gem_loadable?(lib)
       require lib
       true
-    rescue LoadError
+    rescue LoadError => e
+      raise if e.is_a?(Gem::LoadError) || e.path != lib
+
       false
     end
 
