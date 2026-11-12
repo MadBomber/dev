@@ -10,7 +10,8 @@
 # A day other than today: STATUS_DATE=2026-09-22 asgard daily_summary
 # (collector tasks can't take arguments as asgard dependencies, so the date
 # travels via env var instead of a --date option).
-# A week other than the current one: STATUS_WEEK_OF=2026-09-22 asgard weekly_report
+# A week other than the current one (any day in that week; it snaps back
+# to Monday): STATUS_WEEK_OF=2026-09-22 asgard weekly_report
 
 require "date"
 require "fileutils"
@@ -27,6 +28,9 @@ class Tasks
     def status_target_date = Date.parse(ENV.fetch("STATUS_DATE", Date.today.to_s))
 
     def status_dir = File.join(status_repo_root, "notes", "_status")
+
+    # Monday of the week containing date; Sunday belongs to the week before.
+    def status_week_start(date) = date - (date.cwday - 1)
 
     def status_day_bounds(date = status_target_date)
       [date.strftime("%Y-%m-%d 00:00:00"), date.strftime("%Y-%m-%d 23:59:59")]
@@ -294,8 +298,7 @@ class Tasks
 
   desc "Assemble the week's daily summaries into a client status report via Claude"
   def weekly_report
-    today = Date.today
-    monday = ENV.key?("STATUS_WEEK_OF") ? Date.parse(ENV["STATUS_WEEK_OF"]) : today - ((today.wday + 6) % 7)
+    monday = status_week_start(Date.parse(ENV.fetch("STATUS_WEEK_OF", Date.today.to_s)))
     week_files = (0..4).map { |i| File.join(status_dir, "#{monday + i}.md") }.select { |f| File.exist?(f) }
 
     abort "weekly_report: no daily summaries found for the week of #{monday}. Run daily_summary each day first." if week_files.empty?
