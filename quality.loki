@@ -118,6 +118,7 @@ class Tasks
   desc "Check for structural code duplication with Flay (mass >= 150)"
   def flay_check
     return skip_flay unless gem_loadable?("flay")
+    require "flay" # no-op once loaded; keeps Flay below independent of the guard
 
     mass_threshold = 150
 
