@@ -70,6 +70,8 @@ class Tasks
     method_warn = 20.0
     method_fail = 50.0
 
+    return skip_flog unless bundled_gem?("flog") || command_available?("flog")
+
     flog   = bundled_gem?("flog") ? "bundle exec flog" : "flog"
     output = `#{flog} --all --methods-only --quiet #{@@quality_dirs.join(' ')} 2>&1`
     unless $?.success?
@@ -110,7 +112,7 @@ class Tasks
 
   desc "Check for structural code duplication with Flay (mass >= 150)"
   def flay_check
-    require "flay"
+    return skip_flay unless gem_loadable?("flay")
 
     mass_threshold = 150
 
@@ -136,9 +138,7 @@ class Tasks
 
   desc "Check code smells with Reek (fails only on new/worsened files vs .quality/reek_baseline.txt)"
   def reek_check
-    require "reek"
-    require "reek/configuration/app_configuration"
-    require "pathname"
+    return skip_reek unless gem_loadable?("reek")
 
     current = reek_smell_counts(quality_source_files)
 
@@ -175,6 +175,7 @@ class Tasks
 
   desc "Regenerate .quality/reek_baseline.txt (grandfathers current Reek smell counts per file)"
   def reek_baseline
+    abort "Reek: reek is not installed. Install it with `gem install reek`." unless gem_loadable?("reek")
     require "fileutils"
 
     counts = reek_smell_counts(quality_source_files)
@@ -273,7 +274,7 @@ class Tasks
         # ./Gemfile.lock even when the bundle is running from Gemfile.local,
         # so the gate would audit the inactive lockfile.
         "bundle exec bundle-audit check --update --gemfile-lock #{bundle_lockfile}"
-      elsif command_available?("bundle-audit")
+      elsif command_available?("bundle-audit") && File.exist?(bundle_lockfile)
         "bundle-audit check --update --gemfile-lock #{bundle_lockfile}"
       else
         return skip_bundler_audit
@@ -375,6 +376,15 @@ class Tasks
         File.read(bundle_lockfile).match?(/^ {4}#{Regexp.escape(name)} \(/)
     end
 
+# true when +lib+ can be required into asgard's own Ruby (flay and
+    # reek run in-process, so the gem must be installed there).
+    def gem_loadable?(lib)
+      require lib
+      true
+    rescue LoadError
+      false
+    end
+    
     # true if +name+ resolves to an executable file somewhere on PATH.
     def command_available?(name)
       ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).any? do |dir|
@@ -405,8 +415,27 @@ class Tasks
     end
 
     def skip_bundler_audit
-      puts "Bundler Audit: SKIPPED — bundler-audit not found in the bundle or on PATH. " \
-        "Install it with `gem install bundler-audit`."
+      if command_available?("bundle-audit")
+        puts "Bundler Audit: SKIPPED — no #{bundle_lockfile} found."
+      else
+        puts "Bundler Audit: SKIPPED — bundler-audit not found in the bundle or on PATH. " \
+          "Install it with `gem install bundler-audit`."
+      end
+      :skip
+    end
+
+    def skip_flog
+      puts "Flog: SKIPPED — flog not found in the bundle or on PATH. Install it with `gem install flog`."
+      :skip
+    end
+
+    def skip_flay
+      puts "Flay: SKIPPED — flay is not installed in asgard's Ruby. Install it with `gem install flay`."
+      :skip
+    end
+
+    def skip_reek
+      puts "Reek: SKIPPED — reek is not installed in asgard's Ruby. Install it with `gem install reek`."
       :skip
     end
 
