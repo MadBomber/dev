@@ -131,52 +131,18 @@ class Tasks
     result
   end
 
+  # Grandfathered Reek smell counts: reek_baseline writes it, reek_check reads it.
+  REEK_BASELINE_PATH = File.join(".quality", "reek_baseline.txt").freeze
+
   desc "Check code smells with Reek (fails only on new/worsened files vs .quality/reek_baseline.txt)"
   def reek_check
     require "reek"
     require "reek/configuration/app_configuration"
     require "pathname"
 
-    # Resolve .reek.yml by walking up from cwd: a component-level config wins,
-    # otherwise the shared workspace-level one is used.
-    config_file = nil
-    dir = Pathname.new(Dir.pwd).expand_path
-    loop do
-      candidate = dir.join(".reek.yml")
-      if candidate.exist?
-        config_file = candidate.to_s
-        break
-      end
-      break if dir.root?
+    current = reek_smell_counts(quality_source_files)
 
-      dir = dir.parent
-    end
-    # Reek's Examiner defaults its configuration keyword to
-    # AppConfiguration.default — passing an explicit nil overrides that and
-    # crashes (undefined method 'directive_for' for nil), so build the
-    # default ourselves when no .reek.yml was found.
-    config =
-      if config_file
-        Reek::Configuration::AppConfiguration.from_path(Pathname.new(config_file))
-      else
-        Reek::Configuration::AppConfiguration.default
-      end
-
-    # Smell count per file (only files with at least one smell).
-    current = quality_source_files.each_with_object({}) do |file, acc|
-      count = Reek::Examiner.new(File.read(file), configuration: config).smells.size
-      acc[file] = count if count.positive?
-    end
-
-    # Grandfathered smell counts from .quality/reek_baseline.txt ("count\tfile").
-    baseline_path = File.join(".quality", "reek_baseline.txt")
-    baseline = {}
-    if File.exist?(baseline_path)
-      File.readlines(baseline_path).each do |line|
-        count, file = line.strip.split("\t", 2)
-        baseline[file] = count.to_i if file && !file.empty?
-      end
-    end
+    baseline = File.exist?(REEK_BASELINE_PATH) ? parse_reek_baseline(File.read(REEK_BASELINE_PATH)) : {}
 
     new_files = current.reject { |file, _| baseline.key?(file) }
     worsened  = current.select { |file, count| baseline.key?(file) && count > baseline[file] }
@@ -205,6 +171,16 @@ class Tasks
       end
     puts "Reek: #{summary} (see reek_output.txt)"
     result
+  end
+
+  desc "Regenerate .quality/reek_baseline.txt (grandfathers current Reek smell counts per file)"
+  def reek_baseline
+    require "fileutils"
+
+    counts = reek_smell_counts(quality_source_files)
+    FileUtils.mkdir_p(File.dirname(REEK_BASELINE_PATH))
+    File.write(REEK_BASELINE_PATH, reek_baseline_text(counts))
+    puts "Reek: baselined #{counts.values.sum} warning(s) across #{counts.size} file(s) in #{REEK_BASELINE_PATH}"
   end
 
   desc "Check spelling with typos"
@@ -342,6 +318,49 @@ class Tasks
     # Ruby files under the configured @@quality_dirs.
     def quality_source_files
       @@quality_dirs.flat_map { |dir| Dir.glob("#{dir}/**/*.rb") }
+    end
+
+    # Reek configuration from the nearest .reek.yml at or above +start_dir+:
+    # a component-level config wins, otherwise the shared workspace-level one.
+    # Reek's Examiner defaults its configuration keyword to
+    # AppConfiguration.default — passing an explicit nil overrides that and
+    # crashes (undefined method 'directive_for' for nil), so build the
+    # default ourselves when no .reek.yml was found.
+    def reek_configuration(start_dir = Dir.pwd)
+      require "pathname"
+      require "reek"
+      require "reek/configuration/app_configuration"
+
+      config_file = Pathname.new(start_dir).expand_path.ascend.lazy
+        .map { |dir| dir.join(".reek.yml") }.find(&:exist?)
+      if config_file
+        Reek::Configuration::AppConfiguration.from_path(config_file)
+      else
+        Reek::Configuration::AppConfiguration.default
+      end
+    end
+
+    # { file => smell count } for each of +files+ with at least one smell.
+    def reek_smell_counts(files, config = reek_configuration)
+      require "reek"
+
+      files.each_with_object({}) do |file, acc|
+        count = Reek::Examiner.new(File.read(file), configuration: config).smells.size
+        acc[file] = count if count.positive?
+      end
+    end
+
+    # REEK_BASELINE_PATH body: one "count\tfile" line per file, sorted by file.
+    def reek_baseline_text(counts)
+      counts.sort.map { |file, count| "#{count}\t#{file}\n" }.join
+    end
+
+    # { file => count } from a REEK_BASELINE_PATH body; inverse of reek_baseline_text.
+    def parse_reek_baseline(text)
+      text.each_line.each_with_object({}) do |line, acc|
+        count, file = line.strip.split("\t", 2)
+        acc[file] = count.to_i if file && !file.empty?
+      end
     end
 
     # Lockfile for the active Gemfile (BUNDLE_GEMFILE-aware, e.g. the

@@ -78,6 +78,12 @@ file in the repo being checked and prints a one-line summary. Checks whose
 tool or config is absent report SKIP rather than failing; only FAIL blocks. Companion `*_fix` tasks
 (`rubocop_fix`, `typos_fix`) auto-correct what their checks flag.
 
+Reek fails only on files that are new to, or worse than, the per-file smell
+counts grandfathered in `.quality/reek_baseline.txt`. Its companion task,
+`reek_baseline`, regenerates that file from the current smells: run
+`asgard reek_baseline` when a regression is intentional (or to ratchet the
+counts down after a cleanup).
+
 ### quality_rails.loki
 
 Rails-specific `*_check` gates, gated on `RAILS_ROOT` (set in a Rails repo's
