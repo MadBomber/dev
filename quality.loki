@@ -180,7 +180,7 @@ class Tasks
 
   desc "Regenerate .quality/reek_baseline.txt (grandfathers current Reek smell counts per file)"
   def reek_baseline
-    abort "Reek: reek is not installed. Install it with `gem install reek`." unless gem_loadable?("reek")
+    abort "Reek: reek can not be loaded by asgard (not installed, or outside the active bundle). Install it with `gem install reek`." unless gem_loadable?("reek")
     require "fileutils"
 
     counts = reek_smell_counts(quality_source_files)
@@ -387,8 +387,8 @@ class Tasks
     # reek run in-process, so the gem must be installed there). Only the
     # gem itself being absent counts: a LoadError from inside an installed
     # gem, or a Gem::ConflictError, is re-raised so the gate fails loudly.
-    def gem_loadable?(lib)
-      require lib
+    def gem_loadable?(lib, loader: method(:require))
+      loader.call(lib)
       true
     rescue LoadError => e
       raise if e.is_a?(Gem::LoadError) || e.path != lib
@@ -442,12 +442,12 @@ class Tasks
     end
 
     def skip_flay
-      puts "Flay: SKIPPED — flay is not installed in asgard's Ruby. Install it with `gem install flay`."
+      puts "Flay: SKIPPED — flay can not be loaded by asgard (not installed, or outside the active bundle). Install it with `gem install flay`."
       :skip
     end
 
     def skip_reek
-      puts "Reek: SKIPPED — reek is not installed in asgard's Ruby. Install it with `gem install reek`."
+      puts "Reek: SKIPPED — reek can not be loaded by asgard (not installed, or outside the active bundle). Install it with `gem install reek`."
       :skip
     end
 
