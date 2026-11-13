@@ -14,7 +14,7 @@ class Tasks
   DEFAULT_STALE_DAYS = 30
 
   helper(:branch_capture) do |*args|
-    out, status = Open3.capture2("git", *args)
+    out, status = Open3.capture2("git", *args, err: File::NULL)
     [out, status.success?]
   end
 
