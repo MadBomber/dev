@@ -18,6 +18,13 @@
 # `require: rubocop-rails` in its .rubocop.yml — the existing rubocop_check
 # (quality.loki) picks up the added Rails cops automatically.
 
+# bundled_gem? lives in quality.loki. Importing it here lets a project load
+# the Rails gates on their own. The guard, not just import's own
+# already-loaded check, keeps it to one load when dev/ is reached through
+# a symlink: import resolves this file's relative path to the real one, a
+# different string from the symlinked path import_up recorded.
+import "quality.loki" unless Tasks.method_defined?(:bundled_gem?)
+
 class Tasks
   desc "Check for Rails security vulnerabilities with Brakeman"
   def brakeman_check
