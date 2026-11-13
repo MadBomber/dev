@@ -47,7 +47,7 @@ whose `push` also pushes tags).
 | `iterm_tasks.loki` | Terminal fixes: `half_duplex_screen_fix`, `clear_scroll_back_buffer` |
 | `branch_report.loki` | `branch_report [DAYS]`: read-only table of every local and remote branch (ahead/behind and merged measured against `origin/<default>` as of the last fetch, else the local default), then the ones idle (or merged and idle) over DAYS, default 30 |
 | `db_doc.loki` | [tbls](https://github.com/k1LoW/tbls) schema docs into `notes/dbdoc` (needs Postgres up on localhost:5432; `DB_DOC_DSN` overrides the default vbr_development DSN): `db_doc`, `db_doc_diff`, `db_doc_mermaid`, `db_doc_open`, `db_doc_clean` |
-| `rubocop-strict.yml` | Cops that must always fire, regardless of `.rubocop_todo.yml` or inline directives |
+| `rubocop-strict.yml` | Cops kept enabled with no exclusions over `.rubocop_todo.yml` (when inherited after it; see below) |
 
 ### gem_tasks.loki
 
@@ -143,9 +143,18 @@ steps assume asgard 0.6.0):
 
 ### rubocop-strict.yml
 
-A small overlay a repo's `.rubocop.yml` can `inherit_from` to guarantee that
-certain cops (`Lint/Debugger`, `Security/Eval`, `Lint/SuppressedException`)
-stay enabled no matter what `.rubocop_todo.yml` or inline directives say.
+A small overlay a repo's `.rubocop.yml` can `inherit_from` to keep certain
+cops (`Lint/Debugger`, `Security/Eval`, `Lint/SuppressedException`) enabled
+with no file exclusions, overriding `.rubocop_todo.yml`. The guarantee has
+limits:
+
+- List it **after** `.rubocop_todo.yml` in `inherit_from`
+  (`inherit_from: [.rubocop_todo.yml, ../dev/rubocop-strict.yml]`); later
+  entries win, so listed first the todo file's exclusions still apply.
+- Its `Exclude: []` clears nothing when the config sets
+  `inherit_mode: merge: [Exclude]`; inherited exclusions are merged instead.
+- Inline `# rubocop:disable` comments are still honoured unless RuboCop runs
+  with `--ignore-disable-comments`.
 
 ## Conventions
 
