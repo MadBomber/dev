@@ -34,6 +34,33 @@ Because every `.loki` file simply reopens `class Tasks`, imported tasks merge
 into one command set, and a repo may override any task locally (e.g. a repo
 whose `push` also pushes tags).
 
+## Requirements
+
+- **asgard 0.6.0 or later**, which needs **Ruby 4.0 or later**. 0.6.0 adds
+  the background jobs `doc serve` uses and the built-in scheduler these
+  files assume (see Scheduled tasks below).
+- **flay and reek go in asgard's own Ruby.** `flay_check`, `reek_check` and
+  `reek_baseline` load them in-process, so run `gem install flay reek` with
+  the Ruby that runs asgard. Adding them to the project's Gemfile isn't
+  enough unless asgard itself runs under that bundle. The other gates run
+  their tool through the project's bundle or from `PATH`; when one is
+  missing, most print a SKIP line that says how to install it.
+- **Optional command-line tools**, needed only by the tasks listed:
+
+  | Tool | Used by | Install |
+  |------|---------|---------|
+  | `gh` (authenticated) | `github_collect` | `brew install gh`, then `gh auth login` |
+  | `claude` | `weekly_report` | Claude Code CLI, then `claude /login` once |
+  | `icalBuddy` | `calendar_collect` | `brew install ical-buddy` |
+  | `tbls`, `pg_isready` | `db_doc*` tasks | `brew install k1LoW/tap/tbls`; PostgreSQL client tools |
+  | `mkdocs` | `doc` tasks in a MkDocs repo | `asgard doc install` (Homebrew) |
+  | `typos` | `typos_check`, `typos_fix` | `brew install typos-cli` |
+  | `archspec` | `archspec_check` (also needs an `Archspec.rb`) | the archspec CLI |
+
+- **macOS assumptions.** `doc open` and `db_doc_open` call macOS `open`,
+  `doc install` installs mkdocs with Homebrew, and `calendar_collect` reads
+  macOS Calendar through icalBuddy.
+
 ## Contents
 
 | File | Provides |
