@@ -13,9 +13,16 @@ class Tasks
                    File.basename(Dir.pwd).freeze
                  end
 
+  # Prefers lib/<gem_name with - as />/version.rb, then the first version.rb
+  # that actually defines VERSION.
   helper(:gem_version) do
-    file = Dir.glob("lib/**/version.rb").first
-    file ? File.read(file)[/VERSION\s*=\s*['"]([^'"]+)['"]/, 1] : "?.?.?" rescue "?.?.?"
+    pattern = /VERSION\s*=\s*['"]([^'"]+)['"]/
+    preferred = "lib/#{@@gem_name.tr('-', '/')}/version.rb"
+    candidates = [preferred, *Dir.glob("lib/**/version.rb")].uniq.select { File.file?(it) }
+    version = candidates.lazy.map { File.read(it)[pattern, 1] }.find { it && !it.empty? }
+    version || "?.?.?"
+  rescue StandardError
+    "?.?.?"
   end
 
   desc "Open IRB console with gem loaded"
@@ -47,6 +54,7 @@ class Tasks
   depends_on [:quality, :build]
   def release
     version = gem_version
+    abort "Cannot determine #{@@gem_name}'s version from lib/**/version.rb." if version.to_s.empty? || version == "?.?.?"
 
     unless options[:yes]
       print "Release #{@@gem_name} v#{version} to RubyGems? [y/N] "
