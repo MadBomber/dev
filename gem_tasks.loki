@@ -23,6 +23,10 @@ class Tasks
     if File.exist?("bin/console")
       sh "bin/console"
     else
+      # Since Ruby 4.0 irb is a bundled gem, so Bundler won't run it unless it's in the bundle.
+      if File.exist?("Gemfile.lock") && !File.read("Gemfile.lock").match?(/^\s+irb \(/)
+        abort "irb is not in the bundle: add `gem \"irb\"` to the Gemfile's development group, or add a bin/console."
+      end
       sh "bundle exec irb -Ilib -r #{@@gem_name.tr('-', '/')}"
     end
   end
