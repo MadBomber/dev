@@ -70,7 +70,14 @@ class Tasks
     method_warn = 20.0
     method_fail = 50.0
 
-    flog   = bundled_gem?("flog") ? "bundle exec flog" : "flog"
+    flog =
+      if bundled_gem?("flog")
+        "bundle exec flog"
+      elsif command_available?("flog")
+        "flog"
+      else
+        return skip_flog
+      end
     output = `#{flog} --all --methods-only --quiet #{@@quality_dirs.join(' ')} 2>&1`
     unless $?.success?
       File.write("flog_output.txt", output)
@@ -110,7 +117,8 @@ class Tasks
 
   desc "Check for structural code duplication with Flay (mass >= 150)"
   def flay_check
-    require "flay"
+    return skip_flay unless gem_loadable?("flay")
+    require "flay" # no-op once loaded; keeps Flay below independent of the guard
 
     mass_threshold = 150
 
@@ -131,52 +139,16 @@ class Tasks
     result
   end
 
+  # Grandfathered Reek smell counts: reek_baseline writes it, reek_check reads it.
+  REEK_BASELINE_PATH = File.join(".quality", "reek_baseline.txt").freeze
+
   desc "Check code smells with Reek (fails only on new/worsened files vs .quality/reek_baseline.txt)"
   def reek_check
-    require "reek"
-    require "reek/configuration/app_configuration"
-    require "pathname"
+    return skip_reek unless gem_loadable?("reek")
 
-    # Resolve .reek.yml by walking up from cwd: a component-level config wins,
-    # otherwise the shared workspace-level one is used.
-    config_file = nil
-    dir = Pathname.new(Dir.pwd).expand_path
-    loop do
-      candidate = dir.join(".reek.yml")
-      if candidate.exist?
-        config_file = candidate.to_s
-        break
-      end
-      break if dir.root?
+    current = reek_smell_counts(quality_source_files)
 
-      dir = dir.parent
-    end
-    # Reek's Examiner defaults its configuration keyword to
-    # AppConfiguration.default — passing an explicit nil overrides that and
-    # crashes (undefined method 'directive_for' for nil), so build the
-    # default ourselves when no .reek.yml was found.
-    config =
-      if config_file
-        Reek::Configuration::AppConfiguration.from_path(Pathname.new(config_file))
-      else
-        Reek::Configuration::AppConfiguration.default
-      end
-
-    # Smell count per file (only files with at least one smell).
-    current = quality_source_files.each_with_object({}) do |file, acc|
-      count = Reek::Examiner.new(File.read(file), configuration: config).smells.size
-      acc[file] = count if count.positive?
-    end
-
-    # Grandfathered smell counts from .quality/reek_baseline.txt ("count\tfile").
-    baseline_path = File.join(".quality", "reek_baseline.txt")
-    baseline = {}
-    if File.exist?(baseline_path)
-      File.readlines(baseline_path).each do |line|
-        count, file = line.strip.split("\t", 2)
-        baseline[file] = count.to_i if file && !file.empty?
-      end
-    end
+    baseline = File.exist?(REEK_BASELINE_PATH) ? parse_reek_baseline(File.read(REEK_BASELINE_PATH)) : {}
 
     new_files = current.reject { |file, _| baseline.key?(file) }
     worsened  = current.select { |file, count| baseline.key?(file) && count > baseline[file] }
@@ -205,6 +177,17 @@ class Tasks
       end
     puts "Reek: #{summary} (see reek_output.txt)"
     result
+  end
+
+  desc "Regenerate .quality/reek_baseline.txt (grandfathers current Reek smell counts per file)"
+  def reek_baseline
+    abort "Reek: reek can not be loaded by asgard (not installed, or outside the active bundle). Install it with `gem install reek`." unless gem_loadable?("reek")
+    require "fileutils"
+
+    counts = reek_smell_counts(quality_source_files)
+    FileUtils.mkdir_p(File.dirname(REEK_BASELINE_PATH))
+    File.write(REEK_BASELINE_PATH, reek_baseline_text(counts))
+    puts "Reek: baselined #{counts.values.sum} warning(s) across #{counts.size} file(s) in #{REEK_BASELINE_PATH}"
   end
 
   desc "Check spelling with typos"
@@ -292,6 +275,8 @@ class Tasks
     command =
       if File.exist?("bin/bundler-audit")
         "bin/bundler-audit"
+      elsif !File.exist?(bundle_lockfile)
+        return skip_bundler_audit_lockfile
       elsif bundled_gem?("bundler-audit")
         # --gemfile-lock here too: without it bundle-audit defaults to
         # ./Gemfile.lock even when the bundle is running from Gemfile.local,
@@ -344,6 +329,49 @@ class Tasks
       @@quality_dirs.flat_map { |dir| Dir.glob("#{dir}/**/*.rb") }
     end
 
+    # Reek configuration from the nearest .reek.yml at or above +start_dir+:
+    # a component-level config wins, otherwise the shared workspace-level one.
+    # Reek's Examiner defaults its configuration keyword to
+    # AppConfiguration.default — passing an explicit nil overrides that and
+    # crashes (undefined method 'directive_for' for nil), so build the
+    # default ourselves when no .reek.yml was found.
+    def reek_configuration(start_dir = Dir.pwd)
+      require "pathname"
+      require "reek"
+      require "reek/configuration/app_configuration"
+
+      config_file = Pathname.new(start_dir).expand_path.ascend.lazy
+        .map { |dir| dir.join(".reek.yml") }.find(&:exist?)
+      if config_file
+        Reek::Configuration::AppConfiguration.from_path(config_file)
+      else
+        Reek::Configuration::AppConfiguration.default
+      end
+    end
+
+    # { file => smell count } for each of +files+ with at least one smell.
+    def reek_smell_counts(files, config = reek_configuration)
+      require "reek"
+
+      files.each_with_object({}) do |file, acc|
+        count = Reek::Examiner.new(File.read(file), configuration: config).smells.size
+        acc[file] = count if count.positive?
+      end
+    end
+
+    # REEK_BASELINE_PATH body: one "count\tfile" line per file, sorted by file.
+    def reek_baseline_text(counts)
+      counts.sort.map { |file, count| "#{count}\t#{file}\n" }.join
+    end
+
+    # { file => count } from a REEK_BASELINE_PATH body; inverse of reek_baseline_text.
+    def parse_reek_baseline(text)
+      text.each_line.each_with_object({}) do |line, acc|
+        count, file = line.strip.split("\t", 2)
+        acc[file] = count.to_i if file && !file.empty?
+      end
+    end
+
     # Lockfile for the active Gemfile (BUNDLE_GEMFILE-aware, e.g. the
     # Gemfile.local convention used across these repos).
     def bundle_lockfile
@@ -354,6 +382,19 @@ class Tasks
     def bundled_gem?(name)
       File.exist?(bundle_lockfile) &&
         File.read(bundle_lockfile).match?(/^ {4}#{Regexp.escape(name)} \(/)
+    end
+
+    # true when +lib+ can be required into asgard's own Ruby (flay and
+    # reek run in-process, so the gem must be installed there). Only the
+    # gem itself being absent counts: a LoadError from inside an installed
+    # gem, or a Gem::ConflictError, is re-raised so the gate fails loudly.
+    def gem_loadable?(lib, loader: method(:require))
+      loader.call(lib)
+      true
+    rescue LoadError => e
+      raise if e.is_a?(Gem::LoadError) || e.path != lib
+
+      false
     end
 
     # true if +name+ resolves to an executable file somewhere on PATH.
@@ -388,6 +429,26 @@ class Tasks
     def skip_bundler_audit
       puts "Bundler Audit: SKIPPED — bundler-audit not found in the bundle or on PATH. " \
         "Install it with `gem install bundler-audit`."
+      :skip
+    end
+
+    def skip_bundler_audit_lockfile
+      puts "Bundler Audit: SKIPPED — no #{bundle_lockfile} found."
+      :skip
+    end
+
+    def skip_flog
+      puts "Flog: SKIPPED — flog not found in the bundle or on PATH. Install it with `gem install flog`."
+      :skip
+    end
+
+    def skip_flay
+      puts "Flay: SKIPPED — flay can not be loaded by asgard (not installed, or outside the active bundle). Install it with `gem install flay`."
+      :skip
+    end
+
+    def skip_reek
+      puts "Reek: SKIPPED — reek can not be loaded by asgard (not installed, or outside the active bundle). Install it with `gem install reek`."
       :skip
     end
 
