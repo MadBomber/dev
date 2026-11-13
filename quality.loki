@@ -40,7 +40,9 @@ class Tasks
   def quality
     check_tasks = self.class._deps.fetch(:quality, []).flatten.map(&:to_s)
 
-    results = check_tasks.to_h { |name| [quality_gate_label(name), dep_result(name)] }
+    results = check_tasks.to_h do |name|
+      [quality_gate_label(name), quality_check_status(name, dep_result(name))]
+    end
 
     print_quality_summary(results)
   end
@@ -505,6 +507,16 @@ class Tasks
       warn: ["WARN", 33], # yellow
       skip: ["SKIP", 36], # cyan
     }.freeze
+
+    # A *_check task that returns anything but a STATUS_BADGES key counts as
+    # :fail (SKIP or WARN would let a broken gate pass silently), naming the
+    # task and its value so the summary still completes.
+    def quality_check_status(check_name, status)
+      return status if STATUS_BADGES.key?(status)
+
+      puts "#{check_name}: returned #{status.inspect}, not :pass/:fail/:warn/:skip — counting it as FAIL."
+      :fail
+    end
 
     # Colorized status badges plus a pass/fail/warn/skip tally; aborts only
     # if any gate failed — skip and warn are informational, not blocking.
