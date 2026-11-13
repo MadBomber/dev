@@ -51,8 +51,10 @@ class Tasks
     # [stdout, succeeded?] — `ok` is falsy on any failure, so most callers
     # only branch on it. It is nil, not false, when the binary isn't
     # installed, so a caller can tell "missing" from "ran and failed".
+    # The command's stderr is discarded: each caller's SKIP line already
+    # says what failed.
     def safe_capture2(*argv, **opts)
-      out, status = Open3.capture2(*argv, **opts)
+      out, status = Open3.capture2(*argv, err: File::NULL, **opts)
       [out, status.success?]
     rescue Errno::ENOENT
       ["", nil]

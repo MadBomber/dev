@@ -148,7 +148,8 @@ class Tasks
   def reek_check
     return skip_reek unless gem_loadable?("reek")
 
-    current = reek_smell_counts(quality_source_files)
+    config = reek_configuration
+    current = reek_smell_counts(reek_source_files(config), config)
 
     baseline = File.exist?(REEK_BASELINE_PATH) ? parse_reek_baseline(File.read(REEK_BASELINE_PATH)) : {}
 
@@ -186,7 +187,8 @@ class Tasks
     abort "Reek: reek can not be loaded by asgard (not installed, or outside the active bundle). Install it with `gem install reek`." unless gem_loadable?("reek")
     require "fileutils"
 
-    counts = reek_smell_counts(quality_source_files)
+    config = reek_configuration
+    counts = reek_smell_counts(reek_source_files(config), config)
     FileUtils.mkdir_p(File.dirname(REEK_BASELINE_PATH))
     File.write(REEK_BASELINE_PATH, reek_baseline_text(counts))
     puts "Reek: baselined #{counts.values.sum} warning(s) across #{counts.size} file(s) in #{REEK_BASELINE_PATH}"
@@ -351,13 +353,28 @@ class Tasks
       end
     end
 
+    # Ruby files under +dirs+ that reek itself would examine: hidden
+    # directories and .reek.yml's exclude_paths are skipped. Directories
+    # that don't exist are dropped first, as the plain glob did, so Reek
+    # doesn't print "Error: No such file" for a component without app/.
+    def reek_source_files(config = reek_configuration, dirs: @@quality_dirs)
+      require "reek"
+      require "reek/cli/options"
+      require "reek/source/source_locator"
+
+      Reek::Source::SourceLocator.new(dirs.select { File.exist?(it) }, configuration: config).sources
+    end
+
     # { file => smell count } for each of +files+ with at least one smell.
+    # Each file goes to Reek as a Pathname, not its contents, so Reek knows
+    # its path and applies .reek.yml's per-directory (directories:) settings.
     def reek_smell_counts(files, config = reek_configuration)
+      require "pathname"
       require "reek"
 
       files.each_with_object({}) do |file, acc|
-        count = Reek::Examiner.new(File.read(file), configuration: config).smells.size
-        acc[file] = count if count.positive?
+        count = Reek::Examiner.new(Pathname(file), configuration: config).smells.size
+        acc[file.to_s] = count if count.positive?
       end
     end
 
