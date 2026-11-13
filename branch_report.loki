@@ -39,18 +39,26 @@ class Tasks
   end
 
   # One row per ref under prefix: name, last-commit epoch/date, author.
+  # Fields are NUL-separated: branch and author names may contain "|", but
+  # neither can contain NUL.
   # Drops symbolic refs (origin/HEAD) — not a real branch. Its short name
   # abbreviates to the bare remote name ("origin", not "origin/HEAD"), so
   # this filters on %(symref) rather than a "/HEAD" suffix match.
   helper(:branch_rows) do |ref_prefix|
-    fmt = "%(symref)|%(refname:short)|%(committerdate:unix)|%(committerdate:short)|%(authorname)"
+    fmt = "%(symref)%00%(refname:short)%00%(committerdate:unix)%00%(committerdate:short)%00%(authorname)"
     out, = branch_capture("for-each-ref", ref_prefix, "--format=#{fmt}")
     out.each_line.filter_map do |line|
-      symref, name, epoch, date, author = line.chomp.split("|", 5)
+      symref, name, epoch, date, author = line.chomp.split("\0", 5)
       next unless symref.to_s.empty?
 
       { name: name, epoch: epoch.to_i, date: date, author: author.to_s }
     end
+  end
+
+  # Escapes "|" so a branch or author name containing one stays in its
+  # Markdown table cell instead of splitting the row.
+  helper(:branch_cell) do |text|
+    text.to_s.gsub("|", "\\|")
   end
 
   # The default branch itself, local or remote ("main", "origin/main"), is
@@ -127,7 +135,7 @@ class Tasks
         marker = row[:name] == current ? "→" : ""
 
         lines << format("| %s | `%s` | %s | %s | %s | %s | %s | %d |",
-                         marker, row[:name], row[:date], row[:author],
+                         marker, branch_cell(row[:name]), row[:date], branch_cell(row[:author]),
                          ahead.nil? ? "-" : ahead, behind.nil? ? "-" : behind,
                          merged ? "yes" : "no", idle_days)
 
