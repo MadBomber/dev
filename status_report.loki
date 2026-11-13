@@ -50,8 +50,10 @@ class Tasks
 
     # [stdout, succeeded?] — a missing binary or any other spawn failure
     # counts the same as a non-zero exit, so callers only branch on `ok`.
+    # The command's stderr is discarded: each caller's SKIP line already
+    # says what failed.
     def safe_capture2(*argv, **opts)
-      out, status = Open3.capture2(*argv, **opts)
+      out, status = Open3.capture2(*argv, err: File::NULL, **opts)
       [out, status.success?]
     rescue StandardError
       ["", false]
