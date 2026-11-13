@@ -35,7 +35,7 @@ class Tasks
       return Date.today if value.nil?
 
       Date.parse(value)
-    rescue Date::Error
+    rescue ArgumentError # Date::Error, or the date gem's over-128-chars limit
       abort "#{task}: #{var} must be a date like 2026-09-22 (got #{value.inspect})"
     end
 
