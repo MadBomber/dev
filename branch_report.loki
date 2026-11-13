@@ -80,6 +80,9 @@ class Tasks
       abort "branch_report: days must be an integer, got #{days.inspect}"
     end
 
+    _, in_repo = branch_capture("rev-parse", "--git-dir")
+    abort "branch_report: not a git repository" unless in_repo
+
     default_name = branch_default_name
     base = branch_resolvable_base(default_name)
     now = Time.now.to_i
