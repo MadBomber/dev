@@ -48,11 +48,14 @@ class Tasks
       [date.strftime("%Y-%m-%d 00:00:00"), date.strftime("%Y-%m-%d 23:59:59")]
     end
 
-    # [stdout, succeeded?] — a missing binary or any other spawn failure
-    # counts the same as a non-zero exit, so callers only branch on `ok`.
+    # [stdout, succeeded?] — `ok` is falsy on any failure, so most callers
+    # only branch on it. It is nil, not false, when the binary isn't
+    # installed, so a caller can tell "missing" from "ran and failed".
     def safe_capture2(*argv, **opts)
       out, status = Open3.capture2(*argv, **opts)
       [out, status.success?]
+    rescue Errno::ENOENT
+      ["", nil]
     rescue StandardError
       ["", false]
     end
@@ -277,7 +280,8 @@ class Tasks
 
       out, ok = safe_capture2("icalBuddy", "-nc", "-eep", "location,notes,url",
                                "-po", "title,datetime,attendees", from, to)
-      next skip("calendar", "icalBuddy not available (brew install ical-buddy)") unless ok
+      next skip("calendar", "icalBuddy not available (brew install ical-buddy)") if ok.nil?
+      next skip("calendar", "icalBuddy failed (check the terminal's Calendar access)") unless ok
       next skip("calendar", "no events for #{date}") if out.strip.empty?
 
       puts "calendar: events found"
