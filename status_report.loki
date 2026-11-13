@@ -38,8 +38,8 @@ class Tasks
 
     # [stdout, succeeded?] — a missing binary or any other spawn failure
     # counts the same as a non-zero exit, so callers only branch on `ok`.
-    def safe_capture2(*argv)
-      out, status = Open3.capture2(*argv)
+    def safe_capture2(*argv, **opts)
+      out, status = Open3.capture2(*argv, **opts)
       [out, status.success?]
     rescue StandardError
       ["", false]
@@ -148,7 +148,8 @@ class Tasks
   desc "Collect today's GitHub PR/issue activity you were involved in"
   def github_collect
     collect("github") do
-      nwo, ok = safe_capture2("gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner")
+      nwo, ok = safe_capture2("gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner",
+                               chdir: status_repo_root)
       nwo = nwo.strip
       next skip("github", "gh not available or not a GitHub repo") unless ok && !nwo.empty?
 
