@@ -25,7 +25,19 @@ class Tasks
   no_commands do
     def status_repo_root = ENV.fetch("RR", Dir.pwd)
 
-    def status_target_date = Date.parse(ENV.fetch("STATUS_DATE", Date.today.to_s))
+    def status_target_date = status_env_date("STATUS_DATE", "daily_summary")
+
+    # Date from env var `var`, or today when unset. A value Date.parse
+    # can't read aborts with one line instead of a backtrace; SystemExit
+    # isn't a StandardError, so `collect` can't turn it into a SKIP.
+    def status_env_date(var, task)
+      value = ENV.fetch(var, nil)
+      return Date.today if value.nil?
+
+      Date.parse(value)
+    rescue Date::Error
+      abort "#{task}: #{var} must be a date like 2026-09-22 (got #{value.inspect})"
+    end
 
     def status_dir = File.join(status_repo_root, "notes", "_status")
 
@@ -274,11 +286,16 @@ class Tasks
 
   # ---- orchestration ----------------------------------------------------
 
+  # Runs ahead of the collectors so a bad STATUS_DATE stops daily_summary
+  # with one line before any of them start.
+  desc "Abort unless STATUS_DATE (if set) is a readable date"
+  def status_date_check = status_target_date
+
   desc "Collect today's activity from every configured source into notes/_status/<date>.md"
-  depends_on -> { [all_commands.keys.grep(/_collect\z/).sort.map(&:to_sym)] }
+  depends_on -> { [:status_date_check, all_commands.keys.grep(/_collect\z/).sort.map(&:to_sym)] }
   def daily_summary
     date = status_target_date
-    collect_tasks = self.class._deps.fetch(:daily_summary, []).flatten.map(&:to_s)
+    collect_tasks = self.class._deps.fetch(:daily_summary, []).flatten.map(&:to_s).grep(/_collect\z/)
 
     sections = collect_tasks.filter_map do |name|
       body = dep_result(name)
@@ -298,7 +315,7 @@ class Tasks
 
   desc "Assemble the week's daily summaries into a client status report via Claude"
   def weekly_report
-    monday = status_week_start(Date.parse(ENV.fetch("STATUS_WEEK_OF", Date.today.to_s)))
+    monday = status_week_start(status_env_date("STATUS_WEEK_OF", "weekly_report"))
     week_files = (0..4).map { |i| File.join(status_dir, "#{monday + i}.md") }.select { |f| File.exist?(f) }
 
     abort "weekly_report: no daily summaries found for the week of #{monday}. Run daily_summary each day first." if week_files.empty?
