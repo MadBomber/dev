@@ -51,7 +51,7 @@ class Tasks
     unless options[:yes]
       print "Release #{@@gem_name} v#{version} to RubyGems? [y/N] "
       $stdout.flush
-      return puts "Aborted." unless $stdin.gets.strip.downcase == "y"
+      return puts "Aborted." unless $stdin.gets.to_s.strip.downcase == "y"
     end
 
     # Untracked files never reach the gem (git ls-files-based gemspecs), so
