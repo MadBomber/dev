@@ -14,7 +14,7 @@ class Tasks
   DEFAULT_STALE_DAYS = 30
 
   helper(:branch_capture) do |*args|
-    out, status = Open3.capture2("git", *args)
+    out, status = Open3.capture2("git", *args, err: File::NULL)
     [out, status.success?]
   end
 
@@ -79,6 +79,9 @@ class Tasks
     rescue ArgumentError, TypeError
       abort "branch_report: days must be an integer, got #{days.inspect}"
     end
+
+    _, in_repo = branch_capture("rev-parse", "--git-dir")
+    abort "branch_report: not a git repository" unless in_repo
 
     default_name = branch_default_name
     base = branch_resolvable_base(default_name)
