@@ -97,9 +97,9 @@ class Tasks
       score, method_name = m[1].to_f, m[2]
       next unless method_name.include?("#") || method_name.include?("::")
       next if method_name.end_with?("#none")
-      if score > method_fail
+      if score >= method_fail
         failures << "#{"%.1f" % score}: #{method_name}"
-      elsif score > method_warn
+      elsif score >= method_warn
         warnings << "#{"%.1f" % score}: #{method_name}"
       end
     end
