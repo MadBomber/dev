@@ -1,5 +1,6 @@
 # dev/.loki
 # import all of the development loki task files
-# (rails/ is not included: a Rails repo adds import_up "dev/rails/*.loki")
+# (rails/ and client/ are not included: a Rails repo adds
+# import_up "dev/rails/*.loki", a client project import_up "dev/client/*.loki")
 
 import '*.loki'

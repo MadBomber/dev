@@ -1,5 +1,6 @@
 # frozen_string_literal: true
-# dev/status_report.loki — end-of-week client status reporting.
+# dev/client/status_report.loki — end-of-week client status reporting.
+# Import it with `import_up "dev/client/*.loki"`.
 #
 # `daily_summary` collects today's activity from every configured source
 # (each a `*_collect` task, discovered the same way quality.loki discovers

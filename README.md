@@ -41,17 +41,20 @@ That loads all of them whether or not they fit the repo: a repo that
 isn't a gem still gets `build`, `install` and `release`. Import files one
 by one, as above, to keep a repo's command list to what it uses.
 
-The task files in `rails/` are for Rails apps only. Neither `dev/.loki`
-nor a `dev/*.loki` glob reaches into that directory, so a Rails repo
+Two subdirectories hold task files that only some repos want: `rails/`
+for Rails apps and `client/` for client projects. Neither `dev/.loki`
+nor a `dev/*.loki` glob reaches into them, so a repo that wants them
 imports them itself:
 
 ```ruby
-import_up "dev/rails/*.loki"
+import_up "dev/rails/*.loki"    # Rails apps
+import_up "dev/client/*.loki"   # client projects
 ```
 
-`quality_rails.loki` and `db_doc.loki` used to sit at the top level. A
-repo that imports either by its old path (`dev/quality_rails.loki`,
-`dev/db_doc.loki`) must switch to the `dev/rails/` path.
+`quality_rails.loki`, `db_doc.loki` and `status_report.loki` used to sit
+at the top level. A repo that imports one by its old path
+(`dev/quality_rails.loki`, `dev/db_doc.loki`, `dev/status_report.loki`)
+must switch to the `dev/rails/` or `dev/client/` path.
 
 Because every `.loki` file simply reopens `class Tasks`, imported tasks merge
 into one command set, and a repo may override any task locally (e.g. a repo
@@ -89,13 +92,13 @@ whose `push` also pushes tags).
 
 | File | Provides |
 |------|----------|
-| `.loki` | Imports every top-level `*.loki` file below (not `rails/`), for `import_up "dev/.loki"` |
+| `.loki` | Imports every top-level `*.loki` file below (not `rails/` or `client/`), for `import_up "dev/.loki"` |
 | `gem_tasks.loki` | Gem lifecycle: `console`, `build`, `install`, `release` |
 | `quality.loki` | The `quality` gate and the `*_check` tasks it runs |
 | `rails/quality_rails.loki` | Rails-only checks: Brakeman, RailsBestPractices, ActiveRecordDoctor |
 | `git.loki` | Per-repo git basics: `push`, `pull` (ff-only), `fetch` |
 | `doc_tasks.loki` | Documentation site tasks, for a repo with `mkdocs.yml` or `bridgetown.config.yml`: `doc install`, `doc build`, `doc serve`, `doc open` |
-| `status_report.loki` | End-of-week client status reporting: `daily_summary`, `weekly_report` |
+| `client/status_report.loki` | End-of-week client status reporting: `daily_summary`, `weekly_report` |
 | `iterm_tasks.loki` | Terminal fixes: `half_duplex_screen_fix`, `clear_scroll_back_buffer` |
 | `branch_report.loki` | `branch_report [DAYS]`: read-only table of every local and remote branch (ahead/behind and merged measured against `origin/<default>` as of the last fetch, else the local default), then the ones idle (or merged and idle) over DAYS, default 30 |
 | `rails/db_doc.loki` | [tbls](https://github.com/k1LoW/tbls) schema docs into `notes/dbdoc` (needs Postgres up on localhost:5432; `DB_DOC_DSN` overrides the default vbr_development DSN): `db_doc`, `db_doc_diff`, `db_doc_mermaid`, `db_doc_open`, `db_doc_clean` |
@@ -146,7 +149,7 @@ Rails-specific `*_check` gates, gated on `RAILS_ROOT` (set in a Rails repo's
 `.envrc`) rather than `defined?(Rails)`, since Asgard runs outside the app's
 process. Once imported, its checks are picked up by `quality` automatically.
 
-### status_report.loki
+### client/status_report.loki
 
 Personal end-of-week client status reporting. `daily_summary` discovers
 every `*_collect` task the same way `quality` discovers `*_check` tasks,

@@ -3,7 +3,7 @@
 > Shared Asgard task libraries for Ruby projects. The repo holds no application code: just `.loki` task files for Asgard (a Thor-based task runner) and a strict RuboCop overlay.
 
 - Projects don't copy these tasks. They import them with `import_up "dev/<file>.loki"`, which searches upward from the project directory, so `dev/` can sit beside the project or beside any of its parent directories.
-- `import_up "dev/.loki"` imports every top-level task file at once. The Rails-only files are in `rails/`, which it does not load; a Rails repo adds `import_up "dev/rails/*.loki"`.
+- `import_up "dev/.loki"` imports every top-level task file at once. It does not load the two subdirectories: a Rails repo adds `import_up "dev/rails/*.loki"`, and a client project adds `import_up "dev/client/*.loki"`.
 - Every `.loki` file reopens `class Tasks`, so imported tasks merge into one command set and a repo may override any of them locally.
 - `quality` discovers and runs every task whose name ends in `_check`; check tasks return `:pass`, `:fail`, `:warn` or `:skip`, and only `:fail` blocks.
 - Requires asgard 0.6.0 or later (Ruby 4.0 or later). flay and reek must be installed in asgard's own Ruby.
@@ -15,13 +15,13 @@
 
 ## Task files
 
-- [.loki](https://github.com/MadBomber/dev/blob/main/.loki): imports every top-level `*.loki` file (not `rails/`)
+- [.loki](https://github.com/MadBomber/dev/blob/main/.loki): imports every top-level `*.loki` file (not `rails/` or `client/`)
 - [gem_tasks.loki](https://github.com/MadBomber/dev/blob/main/gem_tasks.loki): gem lifecycle: `console`, `build`, `install`, `release`
 - [quality.loki](https://github.com/MadBomber/dev/blob/main/quality.loki): the `quality` gate and its checks: `test_check`, `rubocop_check`, `flog_check`, `flay_check`, `reek_check`, `typos_check`, `erb_lint_check`, `fasterer_check`, `scrap_check`, `bundler_audit_check`, `archspec_check`; plus `rubocop_fix`, `typos_fix`, `reek_baseline`, `test_verbose`
 - [rails/quality_rails.loki](https://github.com/MadBomber/dev/blob/main/rails/quality_rails.loki): Rails-only checks, imported when `RAILS_ROOT` is set: `brakeman_check`, `rails_best_practices_check`, `active_record_doctor_check`
 - [git.loki](https://github.com/MadBomber/dev/blob/main/git.loki): per-repo git basics: `push`, `pull` (fast-forward only), `fetch`
 - [doc_tasks.loki](https://github.com/MadBomber/dev/blob/main/doc_tasks.loki): docs site tasks for a repo with `mkdocs.yml` or `bridgetown.config.yml`: `doc install`, `doc build`, `doc serve`, `doc open`
-- [status_report.loki](https://github.com/MadBomber/dev/blob/main/status_report.loki): end-of-week status reporting: `daily_summary` runs every `*_collect` task, `weekly_report` summarizes the week
+- [client/status_report.loki](https://github.com/MadBomber/dev/blob/main/client/status_report.loki): end-of-week client status reporting: `daily_summary` runs every `*_collect` task, `weekly_report` summarizes the week
 - [iterm_tasks.loki](https://github.com/MadBomber/dev/blob/main/iterm_tasks.loki): terminal fixes: `half_duplex_screen_fix`, `clear_scroll_back_buffer`
 - [branch_report.loki](https://github.com/MadBomber/dev/blob/main/branch_report.loki): `branch_report [DAYS]`, a read-only table of local and remote branches and which are idle or merged
 - [rails/db_doc.loki](https://github.com/MadBomber/dev/blob/main/rails/db_doc.loki): tbls schema docs into `notes/dbdoc`: `db_doc`, `db_doc_diff`, `db_doc_mermaid`, `db_doc_open`, `db_doc_clean`
