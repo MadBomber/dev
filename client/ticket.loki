@@ -1,0 +1,884 @@
+# frozen_string_literal: true
+# dev/client/ticket.loki — Jira tickets from the command line.
+# Import it with `import_up "dev/client/*.loki"`.
+#
+#   asgard ticket browser KEY          — open the ticket in your browser (alias: open);
+#                                        --chrome opens it with JIRA_OPEN_COMMAND
+#                                        (default: open -a "Google Chrome"),
+#                                        NO_OPEN=1 just prints the URL
+#   asgard ticket show KEY             — summary, status, people, dates, links, description;
+#                                        --web opens it in the default browser instead,
+#                                        --chrome (implies --web) as `browser --chrome`
+#   asgard ticket mine                 — your open tickets in JIRA_PROJECT
+#   asgard ticket search JQL           — any JQL query (alias: jql)
+#   asgard ticket ffind [QUERY...]     — fuzzy-find tickets by key, title, status,
+#                                        assignee, or label (--status, --assignee,
+#                                        --label, --type, --show, --open, --markdown,
+#                                        --limit)
+#   asgard ticket transitions KEY      — the transitions the ticket offers right now
+#   asgard ticket move KEY TRANSITION  — run a transition by (partial) name or id
+#   asgard ticket comment KEY TEXT     — add a comment (blank lines split paragraphs)
+#   asgard ticket comments KEY         — read the latest comments (--limit)
+#   asgard ticket history KEY          — the latest changes (--field status, --limit)
+#   asgard ticket ready KEY            — set assignee, --due and --estimate (and
+#                                        --acceptor), the fields many workflows
+#                                        demand before work starts
+#   asgard ticket children EPIC        — the epic's tickets, with a tally by status
+#   asgard ticket remaining KEY        — status report (KEY, Status, Due Date, Title) for
+#                                        KEY and every ticket created after it, as a
+#                                        terminal table (--markdown for a markdown
+#                                        table, --limit)
+#   asgard ticket link A VERB B        — link two tickets: `link 169 blocks 173`,
+#                                        `link 173 "is blocked by" 169`, `link 1 relates 2`
+#   asgard ticket attach KEY FILE...   — upload attachments
+#   asgard ticket detach KEY [NAME...] — delete attachments by id or filename glob
+#                                        (--all for every one); no NAME lists them.
+#                                        Jira cannot restore a deleted attachment
+#   asgard ticket create TYPE SUMMARY  — new ticket (--parent, --description, --assign, --open)
+#   asgard ticket pr KEY               — GitHub PRs whose title or branch names the ticket
+#
+# KEY is a full key (PROJ-175, proj-175) or just the number (175), which is
+# prefixed with JIRA_PROJECT.
+#
+# Environment (e.g. from the project's .envrc):
+#   JIRA_SITE          the site URL, including https://
+#   JIRA_USER_EMAIL    your Atlassian account's email
+#   JIRA_API_KEY       an Atlassian API token, for the REST calls
+#   JIRA_API_TOKEN     the same token, under the name jira-cli reads
+#   JIRA_PROJECT       the project key, e.g. PROJ
+#   JIRA_OPEN_COMMAND  optional: the browser command --chrome runs
+#   JIRA_ACCEPTOR_FIELD optional: the id of an "Acceptor" user custom field
+#                      (e.g. customfield_10484), which turns on `ready --acceptor`
+#   JIRA_GITHUB_REPO   optional: OWNER/REPO for `pr` (default: the repo in
+#                      the current directory)
+#
+# Two backends. jira-cli (ankitpokhrel/jira-cli, `brew install jira-cli`,
+# configured by `jira init`) does show, mine, search, ffind, children, move,
+# comment, comments, link and create. The REST API v3 does what jira-cli
+# cannot:
+#   * transitions — jira-cli cannot list them, and `move` needs the list for
+#     partial matching (jira-cli's own move wants the exact transition name)
+#   * history     — no changelog command
+#   * ready       — due date, original estimate, and a custom field cannot
+#     be edited through jira-cli
+#   * remaining   — `jira issue list --raw` drops duedate; one REST search
+#     beats a `jira issue view` per ticket
+#   * attach / detach — no attachment commands
+#   * link        — the link-type list (for "blocks" / "is blocked by")
+# jira-cli always runs with JIRA_PROJECT unset: it reads JIRA_<KEY> variables
+# as config overrides, and JIRA_PROJECT blanks its `project:` block.
+#
+# A workflow may refuse a transition until some fields are set; `move`
+# prints Jira's own errors when it does, and `ready` sets the usual ones.
+# The browser tasks call macOS `open`.
+
+require "base64"
+require "json"
+require "net/http"
+require "open3"
+require "shellwords"
+require "time"
+require "tty-table"
+require "uri"
+require "yaml"
+
+class TicketCommands < Tasks
+  @@default_chrome_command = %(open -a "Google Chrome")
+  # The id of the site's "Acceptor" user custom field, or nil when the
+  # project has none: `ready --acceptor` and its Epic check are then off.
+  @@acceptor_field         = ENV.fetch("JIRA_ACCEPTOR_FIELD", nil)
+
+  map "open" => "browser", "jql" => "search"
+
+  helper(:jira_env) do |name|
+    value = ENV[name].to_s.strip
+    abort "#{name} is not set — export it, e.g. in the project's .envrc (see the header of dev/client/ticket.loki)." if value.empty?
+    value
+  end
+
+  # "175" → "PROJ-175" (JIRA_PROJECT being PROJ), "proj-175" → "PROJ-175".
+  helper(:jira_key) do |ref|
+    ref = ref.to_s.strip
+    key = ref.match?(/\A\d+\z/) ? "#{jira_env("JIRA_PROJECT")}-#{ref}" : ref.upcase
+    abort "#{ref.inspect} is not a ticket key or number (e.g. PROJ-175 or 175)." unless key.match?(/\A[A-Z][A-Z0-9]+-\d+\z/)
+    key
+  end
+
+  helper(:jira_browse_url) { |key| "#{jira_env("JIRA_SITE").chomp("/")}/browse/#{key}" }
+
+  # argv for opening a URL: the default browser, or JIRA_OPEN_COMMAND for --chrome.
+  helper(:jira_open_argv) do |url, chrome|
+    command = chrome ? ENV.fetch("JIRA_OPEN_COMMAND", @@default_chrome_command) : "open"
+    [*Shellwords.split(command), url]
+  end
+
+  # Opens the URL (NO_OPEN=1 just prints it) — shared by `browser` and `show --web`.
+  helper(:jira_open_url) do |url, chrome|
+    next puts(url) if ENV["NO_OPEN"] == "1"
+
+    system(*jira_open_argv(url, chrome)) || abort("Could not open the browser — #{url}")
+    puts "Opened #{url}#{" in Google Chrome" if chrome}."
+  end
+
+  # One REST call; returns the parsed body (nil for 204). Aborts with Jira's
+  # error messages on any non-2xx response. `form:` sends multipart (attachments).
+  helper(:jira_request) do |verb, path, query: nil, body: nil, form: nil|
+    uri = URI("#{jira_env("JIRA_SITE").chomp("/")}/rest/api/3/#{path}")
+    uri.query = URI.encode_www_form(query) if query
+    req = Net::HTTP.const_get(verb.to_s.capitalize).new(uri)
+    req.basic_auth(jira_env("JIRA_USER_EMAIL"), jira_env("JIRA_API_KEY"))
+    req["Accept"] = "application/json"
+    if body
+      req["Content-Type"] = "application/json"
+      req.body = JSON.generate(body)
+    elsif form
+      req["X-Atlassian-Token"] = "no-check"
+      req.set_form(form, "multipart/form-data")
+    end
+
+    res = Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 10, read_timeout: 30) { |http| http.request(req) }
+    abort "Jira #{verb.to_s.upcase} #{path}: HTTP #{res.code}\n#{jira_error_text(res.body)}" unless res.is_a?(Net::HTTPSuccess)
+
+    res.body.to_s.strip.empty? ? nil : JSON.parse(res.body)
+  end
+
+  # The jira-cli binary: the first `jira` on PATH that is not in the
+  # project's own bin/ (a project may keep a bin/jira wrapper that unsets
+  # JIRA_PROJECT, which jira_cli_env does itself). JIRA_CLI_BIN overrides.
+  helper(:jira_cli_bin) do |path = ENV.fetch("PATH", ""), own_bin = File.expand_path("bin", ENV.fetch("RR", Dir.pwd))|
+    next ENV["JIRA_CLI_BIN"] if ENV["JIRA_CLI_BIN"].to_s.strip != ""
+
+    found = path.split(File::PATH_SEPARATOR)
+                .reject { File.expand_path(it) == own_bin }
+                .map { File.join(it, "jira") }
+                .find { File.file?(it) && File.executable?(it) }
+    found || abort("jira-cli not found on PATH — brew install jira-cli, then jira init.")
+  end
+
+  # Environment for a jira-cli child: JIRA_PROJECT removed (see header).
+  helper(:jira_cli_env) do
+    jira_env("JIRA_API_TOKEN") # fail early with our message, not jira-cli's wall of text
+    { "JIRA_PROJECT" => nil }
+  end
+
+  helper(:jira_strip_ansi) { |text| text.to_s.gsub(/\e\[[\d;]*[A-Za-z]/, "").strip }
+
+  # Runs jira-cli; returns [stdout, stderr, success?]. stdin is empty so it
+  # can never sit on an interactive prompt.
+  helper(:jira_cli_run) do |*args|
+    out, err, status = Open3.capture3(jira_cli_env, jira_cli_bin, *args, stdin_data: "")
+    [out, err, status.success?]
+  end
+
+  helper(:jira_cli_failure) do |args, out, err|
+    "jira #{args.take_while { !it.start_with?("-") }.first(3).join(" ")} failed:\n#{jira_strip_ansi("#{err}\n#{out}")}"
+  end
+
+  # Runs jira-cli and returns its stdout; aborts with its (de-colored)
+  # output on failure.
+  helper(:jira_cli) do |*args|
+    out, err, ok = jira_cli_run(*args)
+    abort jira_cli_failure(args, out, err) unless ok
+    out
+  end
+
+  helper(:jira_cli_json) { |*args| JSON.parse(jira_cli(*args)) }
+
+  # The full REST issue (every field, all comments) via `jira issue view --raw`.
+  helper(:jira_cli_issue) { |key| jira_cli_json("issue", "view", key, "--raw") }
+
+  # Splits a trailing "ORDER BY field [ASC|DESC]" off a JQL query, because
+  # `jira issue list -q` appends its own ORDER BY. Returns
+  # [jql, list_flags]: list_flags is [] (jira-cli default: created DESC)
+  # or ["--order-by", field] plus "--reverse" for ascending.
+  helper(:jira_cli_order) do |jql|
+    m = jql.to_s.strip.match(/\A(?<where>.*?)\s*\bORDER\s+BY\s+(?<field>[\w.]+)(?:\s+(?<dir>ASC|DESC))?\s*\z/im)
+    next [jql.to_s.strip, []] unless m
+
+    flags = ["--order-by", m[:field]]
+    flags << "--reverse" unless m[:dir].to_s.casecmp?("DESC")
+    [m[:where], flags]
+  end
+
+  # argv for `jira issue list --raw` over a JQL filter (jira-cli prepends
+  # project = …). jira-cli pages at most 100 at a time.
+  helper(:jira_cli_list_args) do |jql, limit, *extra|
+    where, order = jira_cli_order(jql)
+    args = ["issue", "list", "--raw", "--paginate", "0:#{limit.to_i.clamp(1, 100)}", *order, *extra]
+    where.empty? ? args : [*args, "-q", where]
+  end
+
+  # jira-cli's issue structs (issueType, status, assignee, summary — no
+  # duedate). jira-cli exits 1 with "No result found" on an empty result;
+  # that alone means [], any other failure aborts.
+  helper(:jira_cli_list) do |jql, limit, *extra|
+    args = jira_cli_list_args(jql, limit, *extra)
+    out, err, ok = jira_cli_run(*args)
+    next JSON.parse(out) if ok
+    next [] if jira_strip_ansi(err).include?("No result found")
+
+    abort jira_cli_failure(args, out, err)
+  end
+
+  helper(:jira_error_text) do |raw|
+    parsed = JSON.parse(raw.to_s)
+    [*parsed["errorMessages"], *parsed.fetch("errors", {}).map { |field, msg| "#{field}: #{msg}" }].join("\n")
+  rescue JSON::ParserError
+    raw.to_s[0, 500]
+  end
+
+  # Atlassian Document Format → plain text. Issue mentions (inlineCard) are
+  # reduced to their key so they are not silently dropped.
+  helper(:jira_adf_text) do |node|
+    case node
+    when Array then node.map { jira_adf_text(it) }.join
+    when Hash
+      case node["type"]
+      when "text"      then node["text"].to_s
+      when "hardBreak" then "\n"
+      when "inlineCard"
+        url = node.dig("attrs", "url").to_s
+        url[%r{/browse/([A-Z][A-Z0-9]+-\d+)}, 1] || url
+      when "mention"   then node.dig("attrs", "text").to_s
+      when "listItem"  then "- #{jira_adf_text(node["content"]).strip}\n"
+      when "paragraph", "heading", "codeBlock", "blockquote", "rule"
+        "#{jira_adf_text(node["content"])}\n\n"
+      else jira_adf_text(node["content"])
+      end
+    else ""
+    end
+  end
+
+  # Picks one transition by id, exact name, or unique partial name.
+  helper(:jira_pick_transition) do |transitions, wanted|
+    wanted = wanted.to_s.strip.downcase
+    by_id    = transitions.select { it["id"] == wanted }
+    by_name  = transitions.select { it["name"].downcase == wanted }
+    by_part  = transitions.select { it["name"].downcase.include?(wanted) || it.dig("to", "name").to_s.downcase.include?(wanted) }
+    [by_id, by_name, by_part].find(&:any?).to_a
+  end
+
+  # One line per issue. Takes REST issues or jira-cli's list structs, which
+  # name the type "issueType" and give an unassigned ticket an empty
+  # displayName rather than a null assignee.
+  helper(:jira_issue_rows) do |issues|
+    issues.map do |issue|
+      f = issue["fields"]
+      type = (f["issuetype"] || f["issueType"] || {})["name"]
+      assignee = f.dig("assignee", "displayName").to_s
+      format("%-11s %-12s %-8s %-18s %s",
+             issue["key"], f.dig("status", "name"), type,
+             assignee.empty? ? "unassigned" : assignee, f["summary"])
+    end
+  end
+
+  # "me" → your accountId; anything else is a Jira user search (name or
+  # email) that must resolve to exactly one active person.
+  helper(:jira_account_id) do |who|
+    next jira_request(:get, "myself").fetch("accountId") if who.to_s.strip.casecmp?("me")
+
+    people = jira_request(:get, "user/search", query: { query: who })
+             .select { it["accountType"] == "atlassian" && it["active"] }
+    exact = people.select { it["displayName"].casecmp?(who) || it["emailAddress"].to_s.casecmp?(who) }
+    people = exact if exact.size == 1
+    abort "No Jira user matches #{who.inspect}." if people.empty?
+    abort "#{who.inspect} matches several people: #{people.map { it["displayName"] }.join(", ")}" if people.size > 1
+    people.first.fetch("accountId")
+  end
+
+  # Fields `ready` should set, given the issue's current fields and the
+  # requested values. Returns [fields_hash, missing_descriptions].
+  helper(:jira_ready_plan) do |current, type, assignee_id:, due:, estimate:, acceptor_id:|
+    fields = {}
+    missing = []
+    fields["assignee"] = { accountId: assignee_id } if assignee_id && current.dig("assignee", "accountId") != assignee_id
+    fields["duedate"] = due if due
+    fields["timetracking"] = { originalEstimate: estimate } if estimate
+    if @@acceptor_field && acceptor_id && current.dig(@@acceptor_field, "accountId") != acceptor_id
+      fields[@@acceptor_field] = { accountId: acceptor_id }
+    end
+
+    missing << "a due date (--due YYYY-MM-DD)" unless due || current["duedate"]
+    missing << "an original estimate (--estimate 2d)" unless estimate || current.dig("timetracking", "originalEstimate")
+    missing << "an Acceptor (--acceptor NAME)" if @@acceptor_field && type == "Epic" && !acceptor_id && !current[@@acceptor_field]
+    [fields, missing]
+  end
+
+  # Resolves "A VERB B" against the site's link types. Returns
+  # [type_name, inward_key, outward_key]. Jira's `inwardIssue` is the
+  # subject of the outward phrase — "A blocks B" posts inwardIssue A,
+  # outwardIssue B (verified 2026-10-05; the opposite of the field names).
+  helper(:jira_link_plan) do |types, a, verb, b|
+    verb = verb.to_s.strip.downcase
+    forward = types.find { |t| [t["outward"], t["name"]].any? { it.downcase == verb } }
+    next [forward["name"], a, b] if forward
+
+    backward = types.find { it["inward"].downcase == verb }
+    next [backward["name"], b, a] if backward
+
+    partial = types.select { |t| [t["name"], t["outward"], t["inward"]].any? { it.downcase.start_with?(verb) } }
+    abort "No link type matches #{verb.inspect}. Types: #{types.map { "#{it["outward"]} / #{it["inward"]}" }.join("; ")}" if partial.empty?
+    abort "#{verb.inspect} is ambiguous: #{partial.map { it["name"] }.join(", ")}" if partial.size > 1
+
+    t = partial.first
+    t["inward"].downcase.start_with?(verb) && !t["outward"].downcase.start_with?(verb) ? [t["name"], b, a] : [t["name"], a, b]
+  end
+
+  helper(:jira_link_lines) do |links|
+    Array(links).map do |link|
+      if link["outwardIssue"]
+        "#{link.dig("type", "outward")} #{link.dig("outwardIssue", "key")}"
+      else
+        "#{link.dig("type", "inward")} #{link.dig("inwardIssue", "key")}"
+      end
+    end
+  end
+
+  # "2026-10-13T16:20:42.823-0600" → "2026-10-13 16:20".
+  helper(:jira_time) { |stamp| stamp.to_s[0, 16].tr("T", " ") }
+
+  # Changelog histories → printable lines, optionally only one field.
+  helper(:jira_history_lines) do |histories, field|
+    histories.flat_map do |h|
+      h.fetch("items", []).filter_map do |item|
+        next if field && !item["field"].casecmp?(field)
+
+        from = item["fromString"] || item["from"] || "-"
+        to   = item["toString"] || item["to"] || "-"
+        format("%-16s %-20s %-14s %s → %s", jira_time(h["created"]), h.dig("author", "displayName").to_s[0, 20],
+               item["field"], from.to_s.tr("\n", " ")[0, 40], to.to_s.tr("\n", " ")[0, 40])
+      end
+    end
+  end
+
+  # Attachments matching any of `patterns` — an id, or a filename glob
+  # (case-insensitive, e.g. "*.png"). Returns [matched, unmatched_patterns].
+  helper(:jira_pick_attachments) do |attachments, patterns|
+    hits = patterns.to_h do |pattern|
+      [pattern, attachments.select { it["id"] == pattern || File.fnmatch?(pattern, it["filename"], File::FNM_CASEFOLD) }]
+    end
+    [hits.values.flatten.uniq { it["id"] }, hits.select { |_, found| found.empty? }.keys]
+  end
+
+  helper(:jira_attachment_line) do |a|
+    format("  %-7s %-50s %8.1f KB  %s", a["id"], a["filename"], a["size"].to_i / 1024.0, jira_time(a["created"]))
+  end
+
+  # PRs whose title or head branch names the ticket (PROJ-17 must not match PROJ-175).
+  helper(:jira_prs_for) do |key, prs|
+    pattern = /#{Regexp.escape(key)}(?!\d)/i
+    prs.select { pattern.match?(it["title"]) || pattern.match?(it["headRefName"]) }
+  end
+
+  helper(:jira_search_issues) do |jql, limit, fields = "summary,status,issuetype,assignee"|
+    jira_request(:get, "search/jql", query: { jql: jql, maxResults: limit, fields: fields })
+      .fetch("issues", [])
+  end
+
+  # Issues → [KEY, Status, Due Date, Title] rows for the `remaining` report.
+  helper(:jira_remaining_rows) do |issues|
+    issues.map do |issue|
+      f = issue["fields"]
+      [issue["key"], f.dig("status", "name").to_s, f["duedate"] || "—", f["summary"].to_s]
+    end
+  end
+
+  # Header + rows → markdown table lines, columns padded so the source
+  # also reads aligned.
+  helper(:jira_markdown_table) do |header, rows|
+    widths = ([header] + rows).transpose.map { |col| col.map(&:length).max }
+    line = ->(cells) { "| #{cells.each_with_index.map { |c, i| c.ljust(widths[i]) }.join(" | ")} |" }
+    [line.call(header), "|#{widths.map { "-" * (it + 2) }.join("|")}|", *rows.map { line.call(it) }]
+  end
+
+  # Word-wraps text to lines of at most `width` characters (a word longer
+  # than `width` stays whole on its own line).
+  helper(:jira_wrap) do |text, width|
+    text.split.each_with_object([]) do |word, lines|
+      if lines.empty? || lines.last.length + 1 + word.length > width
+        lines << word.dup
+      else
+        lines.last << " " << word
+      end
+    end.join("\n")
+  end
+
+  # Header + rows → a TTY::Table drawn with unicode borders. Every column but
+  # the last keeps its natural width; the last (Title) is word-wrapped into
+  # whatever `width` leaves, never below 20 characters. tty-table's own
+  # resize shrinks all columns proportionally, which shreds the short ones.
+  helper(:jira_terminal_table) do |header, rows, width|
+    fixed = header[0..-2].each_index.sum { |i| ([header] + rows).map { it[i].length }.max + 3 }
+    room = [width - fixed - 4, 20].max
+    wrapped = rows.map { [*it[0..-2], jira_wrap(it.last, room)] }
+    TTY::Table.new(header: header, rows: wrapped).render(:unicode, padding: [0, 1], multiline: true)
+  end
+
+  desc "browser KEY", "Open a ticket in your browser (alias: open); --chrome for JIRA_OPEN_COMMAND / Google Chrome"
+  method_option :chrome, type: :boolean, desc: "Open with JIRA_OPEN_COMMAND (default: Google Chrome) instead of the default browser"
+  def browser(ref)
+    jira_open_url(jira_browse_url(jira_key(ref)), options[:chrome])
+  end
+
+  desc "show KEY", "Show a ticket: summary, status, people, dates, links, description; --web to open it instead"
+  method_option :web, type: :boolean, desc: "Open the ticket in the default browser instead of printing it"
+  method_option :chrome, type: :boolean, desc: "With --web (implied), open with JIRA_OPEN_COMMAND (default: Google Chrome)"
+  def show(ref)
+    key = jira_key(ref)
+    return jira_open_url(jira_browse_url(key), options[:chrome]) if options[:web] || options[:chrome]
+
+    puts jira_issue_text(key, jira_cli_issue(key)["fields"])
+  end
+
+  # The `show` report for one REST issue's fields.
+  helper(:jira_issue_text) do |key, f|
+    links = jira_link_lines(f["issuelinks"])
+
+    <<~ISSUE
+      #{key}  #{f["summary"]}
+      #{jira_browse_url(key)}
+
+        Type:      #{f.dig("issuetype", "name")}
+        Status:    #{f.dig("status", "name")}
+        Priority:  #{f.dig("priority", "name") || "-"}
+        Assignee:  #{f.dig("assignee", "displayName") || "unassigned"}
+        Reporter:  #{f.dig("reporter", "displayName") || "-"}
+        Due:       #{f["duedate"] || "-"}
+        Estimate:  #{f.dig("timetracking", "originalEstimate") || "-"}
+        Parent:    #{f["parent"] ? "#{f.dig("parent", "key")} #{f.dig("parent", "fields", "summary")}" : "-"}
+        Labels:    #{Array(f["labels"]).join(", ").then { it.empty? ? "-" : it }}
+        Links:     #{links.empty? ? "-" : links.join("; ")}
+        Updated:   #{f["updated"]}
+
+      #{jira_adf_text(f["description"]).strip.then { it.empty? ? "(no description)" : it }}
+    ISSUE
+  end
+
+  desc "mine", "List your open tickets in JIRA_PROJECT"
+  method_option :limit, type: :numeric, default: 50, desc: "Maximum tickets to list"
+  def mine
+    jql = "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC"
+    rows = jira_issue_rows(jira_cli_list(jql, options[:limit]))
+    abort "No open tickets assigned to you in #{jira_env("JIRA_PROJECT")}." if rows.empty?
+
+    puts rows
+  end
+
+  desc "search JQL", "List tickets matching a JQL query within the project (alias: jql)"
+  method_option :limit, type: :numeric, default: 50, desc: "Maximum tickets to list (jira-cli caps it at 100)"
+  def search(*jql)
+    jql = jql.join(" ")
+    abort %(Give a JQL query, e.g.: asgard ticket search 'parent = PROJ-166 ORDER BY key') if jql.strip.empty?
+
+    rows = jira_issue_rows(jira_cli_list(jql, options[:limit]))
+    # jira-cli reports a JQL syntax error as "No result found" too, and
+    # its --debug output stops before the response, so say so.
+    abort "No tickets match: #{jql}\n(jira-cli reports invalid JQL the same way — check field names and quoting.)" if rows.empty?
+
+    puts rows
+  end
+
+  desc "transitions KEY", "List the transitions a ticket offers right now"
+  def transitions(ref)
+    key = jira_key(ref)
+    list = jira_request(:get, "issue/#{key}/transitions").fetch("transitions", [])
+    abort "#{key} offers no transitions." if list.empty?
+
+    puts "#{key} can move:"
+    list.each { puts format("  %-4s %-16s → %s", it["id"], it["name"], it.dig("to", "name")) }
+  end
+
+  desc "move KEY TRANSITION", "Run a transition by (partial) name, target status, or id"
+  def move(ref, *wanted)
+    key = jira_key(ref)
+    wanted = wanted.join(" ")
+    abort "Give a transition, e.g.: asgard ticket move #{key} complete  (see: asgard ticket transitions #{key})" if wanted.strip.empty?
+
+    list = jira_request(:get, "issue/#{key}/transitions").fetch("transitions", [])
+    matches = jira_pick_transition(list, wanted)
+    available = list.map { "#{it["name"]} (→ #{it.dig("to", "name")})" }.join(", ")
+    abort "No transition matches #{wanted.inspect}. #{key} offers: #{available}" if matches.empty?
+    abort "#{wanted.inspect} is ambiguous: #{matches.map { it["name"] }.join(", ")}" if matches.size > 1
+
+    # Matching needs the REST list; jira-cli then runs it by exact name.
+    transition = matches.first
+    jira_cli("issue", "move", key, transition["name"])
+    puts "#{key}: #{transition["name"]} → #{transition.dig("to", "name")}"
+  end
+
+  desc "comment KEY TEXT", "Add a comment to a ticket (markdown; blank lines split paragraphs)"
+  def comment(ref, *text)
+    key = jira_key(ref)
+    text = text.join(" ")
+    abort "Give the comment text." if text.strip.empty?
+
+    jira_cli("issue", "comment", "add", key, text, "--no-input")
+    puts "Commented on #{key}: #{jira_browse_url(key)}"
+  end
+
+  # The last `limit` comments, oldest first, from a REST issue's fields.
+  helper(:jira_latest_comments) do |fields, limit|
+    Array(fields.dig("comment", "comments")).sort_by { it["created"].to_s }.last(limit)
+  end
+
+  desc "comments KEY", "Read a ticket's latest comments, newest last"
+  method_option :limit, type: :numeric, default: 5, desc: "How many comments"
+  def comments(ref)
+    key = jira_key(ref)
+    list = jira_latest_comments(jira_cli_issue(key)["fields"], options[:limit])
+    abort "#{key} has no comments." if list.empty?
+
+    list.each do |c|
+      puts "── #{c.dig("author", "displayName")}, #{jira_time(c["created"])}"
+      puts jira_adf_text(c["body"]).strip, ""
+    end
+  end
+
+  desc "history KEY", "Show a ticket's latest changes (--field status for status moves only)"
+  method_option :limit, type: :numeric, default: 20, desc: "How many change entries"
+  method_option :field, type: :string, desc: "Only changes to this field (e.g. status, assignee, duedate)"
+  def history(ref)
+    key = jira_key(ref)
+    # The changelog is oldest-first; read the total, then the last page.
+    total = jira_request(:get, "issue/#{key}/changelog", query: { maxResults: 1 }).fetch("total", 0)
+    histories = jira_request(:get, "issue/#{key}/changelog",
+                             query: { startAt: [total - 100, 0].max, maxResults: 100 }).fetch("values", [])
+    lines = jira_history_lines(histories, options[:field]).last(options[:limit])
+    abort "#{key} has no #{options[:field] || ""} changes in its last 100 changelog entries.".squeeze(" ") if lines.empty?
+
+    puts lines
+  end
+
+  desc "ready KEY", "Set the fields a workflow usually demands before work starts: assignee, --due, --estimate, --acceptor (Epic)"
+  method_option :due, type: :string, desc: "Due date, YYYY-MM-DD"
+  method_option :estimate, type: :string, desc: "Original estimate, e.g. 2d or 1w"
+  method_option :assignee, type: :string, default: "me", desc: "Name or email (default: you)"
+  method_option :acceptor, type: :string, desc: "Acceptor name or email (Epics; needs JIRA_ACCEPTOR_FIELD)"
+  def ready(ref)
+    key = jira_key(ref)
+    abort "--due must be YYYY-MM-DD." if options[:due] && !options[:due].match?(/\A\d{4}-\d{2}-\d{2}\z/)
+    abort "--acceptor needs JIRA_ACCEPTOR_FIELD, the id of the site's Acceptor custom field." if options[:acceptor] && !@@acceptor_field
+
+    issue = jira_request(:get, "issue/#{key}", query: { fields: ["issuetype", "assignee", "duedate", "timetracking", "status", @@acceptor_field].compact.join(",") })
+    current = issue["fields"]
+    type = current.dig("issuetype", "name")
+    fields, missing = jira_ready_plan(current, type,
+                                      assignee_id: jira_account_id(options[:assignee]),
+                                      due: options[:due], estimate: options[:estimate],
+                                      acceptor_id: options[:acceptor] && jira_account_id(options[:acceptor]))
+    abort "#{key} (#{type}) still needs #{missing.join(", ")}." if missing.any?
+
+    if fields.empty?
+      puts "#{key} already has everything set."
+    else
+      jira_request(:put, "issue/#{key}", body: { fields: fields })
+      puts "#{key}: set #{fields.keys.map { it == @@acceptor_field ? "acceptor" : it }.join(", ")}."
+    end
+    puts "Status: #{current.dig("status", "name")}. Next: asgard ticket transitions #{key}"
+  end
+
+  desc "children EPIC", "List an epic's tickets with a tally by status"
+  def children(ref)
+    key = jira_key(ref)
+    issues = jira_cli_list("ORDER BY key ASC", 100, "--parent", key)
+    abort "#{key} has no child tickets." if issues.empty?
+
+    puts jira_issue_rows(issues)
+    tally = issues.map { it.dig("fields", "status", "name") }.tally.sort_by { -it.last }
+    puts "", "#{issues.size} ticket(s): #{tally.map { |status, n| "#{n} #{status}" }.join(", ")}"
+  end
+
+  desc "remaining KEY", "Status report (KEY, Status, Due Date, Title) for KEY and every ticket created after it"
+  method_option :limit, type: :numeric, default: 100, desc: "Maximum tickets to list"
+  method_option :markdown, type: :boolean, default: false, desc: "Print a markdown table instead of a terminal table"
+  def remaining(ref)
+    key = jira_key(ref)
+    jql = "project = #{jira_env("JIRA_PROJECT")} AND key >= #{key} ORDER BY key ASC"
+    issues = jira_search_issues(jql, options[:limit], "summary,status,duedate")
+    abort "No tickets from #{key} onward in #{jira_env("JIRA_PROJECT")}." if issues.empty?
+
+    header = ["KEY", "Status", "Due Date", "Title"]
+    rows = jira_remaining_rows(issues)
+    if options[:markdown]
+      puts jira_markdown_table(header, rows)
+    else
+      puts jira_terminal_table(header, rows, TTY::Screen.width)
+    end
+  end
+
+  # ---- ffind: fjira's fuzzy finder, without the TUI -----------------------
+
+  # Score of one query term against one lowercased text, or nil when the
+  # term's letters do not all appear in order. A whole-word hit beats a
+  # substring, which beats a scattered (fzf-style) subsequence; earlier and
+  # tighter matches score higher.
+  helper(:jira_fuzzy_term_score) do |term, text|
+    if (at = text.index(term))
+      word_start = at.zero? || text[at - 1].match?(/[^a-z0-9]/)
+      word_end   = (at + term.length == text.length) || text[at + term.length].match?(/[^a-z0-9]/)
+      next 100 + (word_start ? 40 : 0) + (word_start && word_end ? 20 : 0) - [at, 30].min
+    end
+
+    # Scattered letters only count while they stay close together (within
+    # 3x the term's length), so a long title or an embedded id cannot match
+    # anything by accident.
+    gaps = 0
+    first = pos = nil
+    term.each_char do |ch|
+      found = text.index(ch, pos ? pos + 1 : 0) or break(gaps = nil)
+      gaps += found - pos - 1 if pos
+      first ||= found
+      pos = found
+    end
+    next nil if gaps.nil? || pos - first + 1 > term.length * 3
+
+    [50 - gaps, 1].max
+  end
+
+  # Score of a whole query against a text: every whitespace-separated term
+  # must match (like fzf), and the scores add up. nil when any term misses;
+  # an empty query matches everything with score 0.
+  helper(:jira_fuzzy_score) do |query, text|
+    text = text.to_s.downcase
+    query.to_s.downcase.split.sum do |term|
+      jira_fuzzy_term_score(term, text) or break nil
+    end
+  end
+
+  # What a ticket is matched on: key, summary, status, assignee, labels.
+  helper(:jira_ffind_haystack) do |issue|
+    f = issue["fields"]
+    [issue["key"], f["summary"], f.dig("status", "name"), f.dig("assignee", "displayName"), *Array(f["labels"])].compact.join(" ")
+  end
+
+  # Issues matching the query, best first (ties: newest key first).
+  helper(:jira_ffind_rank) do |issues, query|
+    scored = issues.filter_map do |issue|
+      score = jira_fuzzy_score(query, jira_ffind_haystack(issue))
+      [score, issue] if score
+    end
+    scored.sort_by { |score, issue| [-score, -issue["key"][/\d+\z/].to_i] }.map(&:last)
+  end
+
+  # jira-cli list flags for ffind's filters. Each value may be a comma list;
+  # jira-cli takes a leading ~ as "not" (--status '~Done').
+  helper(:jira_ffind_filters) do |status: nil, assignee: nil, label: nil, type: nil|
+    flags = []
+    status.to_s.split(",").map(&:strip).reject(&:empty?).each { flags += ["-s", it] }
+    label.to_s.split(",").map(&:strip).reject(&:empty?).each { flags += ["-l", it] }
+    flags += ["-a", assignee == "me" ? jira_env("JIRA_USER_EMAIL") : assignee] if assignee
+    flags += ["-t", type] if type
+    flags
+  end
+
+  # argv for one page of ffind's fetch: newest key first, and below `before`
+  # (a key) when given. Pages by key rather than offset because jira-cli
+  # 1.7.0 drops the --paginate offset on Jira's /search/jql endpoint, so
+  # "100:100" returns the first page again.
+  # `jql` (optional) narrows every page; it is ANDed with the key bound
+  # because jira-cli takes only one -q.
+  helper(:jira_ffind_page_args) do |filters, before = nil, jql = nil|
+    args = ["issue", "list", "--raw", "--paginate", "0:100", "--order-by", "key", *filters]
+    where = [jql && "(#{jql})", before && "key < #{before}"].compact
+    where.empty? ? args : [*args, "-q", where.join(" AND ")]
+  end
+
+  # Every project ticket matching the filters (and `jql`), 100 per
+  # jira-cli call.
+  helper(:jira_ffind_fetch) do |filters, max = 2000, jql: nil|
+    issues = []
+    loop do
+      args = jira_ffind_page_args(filters, issues.last&.fetch("key"), jql)
+      out, err, ok = jira_cli_run(*args)
+      break if !ok && jira_strip_ansi(err).include?("No result found")
+      abort jira_cli_failure(args, out, err) unless ok
+
+      page = JSON.parse(out)
+      issues.concat(page)
+      break if page.size < 100 || issues.size >= max
+    end
+    issues.uniq { it["key"] }
+  end
+
+  helper(:jira_ffind_rows) do |issues|
+    issues.map do |issue|
+      f = issue["fields"]
+      assignee = f.dig("assignee", "displayName").to_s
+      [issue["key"], f.dig("status", "name").to_s, assignee.empty? ? "—" : assignee, f["summary"].to_s]
+    end
+  end
+
+  desc "ffind [QUERY...]", "Fuzzy-find tickets by key, title, status, assignee, or label (fjira without the TUI)"
+  long_desc <<~TEXT
+    Prints the project's tickets that fuzzy-match QUERY, best match first.
+    Every word must match, in any order; a word's letters may be scattered
+    ("cdpsyn" finds "CDP synthetic"). With no QUERY, lists the newest tickets.
+
+    Filters (run in Jira, before matching) mirror fjira's F1-F3 keys:
+    --status, --assignee, --label, plus --type. Comma lists are allowed and a
+    leading ~ negates: --status '~Done,~Canceled'.
+
+    --show prints the best match in full; --open opens it in the browser.
+  TEXT
+  method_option :status, type: :string, desc: "Status filter, e.g. 'In Review' or '~Done,~Canceled'"
+  method_option :assignee, type: :string, desc: "Assignee email or name; 'me' for you, 'x' for unassigned"
+  method_option :label, type: :string, desc: "Label filter (comma list)"
+  method_option :type, type: :string, desc: "Issue type, e.g. Task, Story, Epic"
+  method_option :limit, type: :numeric, default: 25, desc: "Maximum matches to print"
+  method_option :show, type: :boolean, default: false, desc: "Print the best match in full instead of the list"
+  method_option :open, type: :boolean, default: false, desc: "Open the best match in the browser"
+  method_option :markdown, type: :boolean, default: false, desc: "Print a markdown table instead of a terminal table"
+  def ffind(*query)
+    query = query.join(" ")
+    filters = jira_ffind_filters(status: options[:status], assignee: options[:assignee],
+                                 label: options[:label], type: options[:type])
+    pool = jira_ffind_fetch(filters)
+    matches = jira_ffind_rank(pool, query)
+    abort "No tickets match #{query.inspect} (searched #{pool.size})." if matches.empty?
+
+    best = matches.first["key"]
+    return jira_open_url(jira_browse_url(best), false) if options[:open]
+    return puts(jira_issue_text(best, jira_cli_issue(best)["fields"])) if options[:show]
+
+    shown = matches.first(options[:limit])
+    header = ["KEY", "Status", "Assignee", "Title"]
+    rows = jira_ffind_rows(shown)
+    puts(options[:markdown] ? jira_markdown_table(header, rows) : jira_terminal_table(header, rows, TTY::Screen.width))
+    puts "#{shown.size} of #{matches.size} match(es) among #{pool.size} ticket(s)."
+  end
+
+  desc "link A VERB B", "Link tickets: `link 169 blocks 173`, `link 173 \"is blocked by\" 169`, `link 1 relates 2`"
+  def link(a_ref, *rest)
+    abort %(usage: asgard ticket link A VERB B  e.g. asgard ticket link 169 blocks 173) if rest.size < 2
+
+    a = jira_key(a_ref)
+    b = jira_key(rest.last)
+    verb = rest[0..-2].join(" ")
+    types = jira_request(:get, "issueLinkType").fetch("issueLinkTypes", [])
+    type_name, inward, outward = jira_link_plan(types, a, verb, b)
+
+    # jira-cli posts its first key as inwardIssue and its second as
+    # outwardIssue, the same as the REST body jira_link_plan is built for.
+    jira_cli("issue", "link", inward, outward, type_name)
+    # Read back what Jira now says about A, so a reversed link is obvious.
+    links = jira_cli_issue(a).dig("fields", "issuelinks")
+    puts "#{a} now: #{jira_link_lines(links).join("; ")}"
+  end
+
+  desc "attach KEY FILE...", "Upload one or more files to a ticket"
+  def attach(ref, *paths)
+    key = jira_key(ref)
+    abort "Give at least one file." if paths.empty?
+    paths.each { abort "No such file: #{it}" unless File.file?(it) }
+
+    paths.each do |path|
+      File.open(path, "rb") do |file|
+        added = jira_request(:post, "issue/#{key}/attachments", form: [["file", file, { filename: File.basename(path) }]])
+        puts "Attached #{Array(added).map { it["filename"] }.join(", ")} to #{key}."
+      end
+    end
+  end
+
+  desc "detach KEY [NAME...]", "Delete attachments by id or filename glob (--all for every one); with neither, list them"
+  method_option :all, type: :boolean, default: false, desc: "Delete every attachment on the ticket"
+  def detach(ref, *patterns)
+    key = jira_key(ref)
+    attachments = Array(jira_request(:get, "issue/#{key}", query: { fields: "attachment" }).dig("fields", "attachment"))
+    abort "#{key} has no attachments." if attachments.empty?
+
+    if patterns.empty? && !options[:all]
+      puts "#{key} attachments:", attachments.map { jira_attachment_line(it) }
+      puts "", "Delete with: asgard ticket detach #{key.split("-").last} NAME|ID|GLOB...   (or --all)"
+      return
+    end
+
+    doomed, unmatched = options[:all] ? [attachments, []] : jira_pick_attachments(attachments, patterns)
+    # Refuse the whole run if any name misses, so a typo never deletes a partial set.
+    abort "No attachment on #{key} matches: #{unmatched.join(", ")}. Run: asgard ticket detach #{key}" if unmatched.any?
+
+    doomed.each do |a|
+      jira_request(:delete, "attachment/#{a["id"]}")
+      puts "Deleted from #{key}:#{jira_attachment_line(a).delete_prefix(" ")}"
+    end
+  end
+
+  # Issue type names jira-cli cached at `jira init` (issue.types in its
+  # config), in the project's own spelling: Task, Sub-task, Story, ...
+  helper(:jira_cli_issue_types) do |config = ENV.fetch("JIRA_CONFIG_FILE") { File.expand_path("~/.config/.jira/.config.yml") }|
+    abort "No jira-cli config at #{config} — run jira init." unless File.file?(config)
+
+    Array(YAML.safe_load_file(config).dig("issue", "types")).map { it["name"] }
+  end
+
+  # argv for jira-cli to create a ticket of an exact type name. Epics go
+  # through `epic create` without -n: jira-cli would put -n in the legacy
+  # Epic Name field, which a project's Epic create screen may not have.
+  # `issue create --raw` prints JSON; `epic create` only prints the URL.
+  helper(:jira_create_args) do |type, summary, parent: nil, description: nil, assignee: nil|
+    args = type == "Epic" ? %w[epic create] : ["issue", "create", "-t", type, "--raw"]
+    args += ["-s", summary, "--no-input"]
+    args += ["-P", parent] if parent
+    args += ["-b", description] if description
+    args += ["-a", assignee] if assignee
+    args
+  end
+
+  # First ticket key in a jira-cli message such as ".../browse/PROJ-204".
+  helper(:jira_key_in) { |text| jira_strip_ansi(text)[%r{/browse/([A-Z][A-Z0-9]+-\d+)}, 1] }
+
+  desc "create TYPE SUMMARY", "Create a ticket (TYPE: Task, Bug, Story, Epic, ...); --parent, --description, --assign, --open"
+  method_option :parent, type: :string, desc: "Parent epic key or number"
+  method_option :description, type: :string, desc: "Description (markdown; blank lines split paragraphs)"
+  method_option :assign, type: :boolean, default: false, desc: "Assign it to you"
+  method_option :open, type: :boolean, default: false, desc: "Open it in the browser afterwards"
+  def create(type_name, *summary)
+    summary = summary.join(" ").strip
+    abort "Give a summary." if summary.empty?
+
+    types = jira_cli_issue_types
+    type = types.find { it.casecmp?(type_name) }
+    abort "#{jira_env("JIRA_PROJECT")} has no issue type #{type_name.inspect}. Types: #{types.join(", ")}" unless type
+    abort "An Epic cannot have a parent." if type == "Epic" && options[:parent]
+
+    args = jira_create_args(type, summary,
+                            parent: options[:parent] && jira_key(options[:parent]),
+                            description: options[:description],
+                            assignee: options[:assign] ? jira_env("JIRA_USER_EMAIL") : nil)
+    out = jira_cli(*args)
+    key = type == "Epic" ? jira_key_in(out) : JSON.parse(out).fetch("key")
+    abort "jira-cli created the ticket but its key was not in the output:\n#{jira_strip_ansi(out)}" unless key
+
+    url = jira_browse_url(key)
+    puts "Created #{key}: #{url}"
+    system(*jira_open_argv(url, false)) if options[:open]
+  end
+
+  # argv for `gh pr list` over PRs that mention +key+; +repo+ (OWNER/REPO)
+  # is left out to use the repo in the current directory. Pure.
+  helper(:jira_pr_list_argv) do |key, repo = ENV.fetch("JIRA_GITHUB_REPO", nil)|
+    argv = ["gh", "pr", "list", "--search", key, "--state", "all", "--limit", "50",
+            "--json", "number,title,state,url,headRefName,baseRefName"]
+    repo.to_s.strip.empty? ? argv : [*argv, "--repo", repo.strip]
+  end
+
+  desc "pr KEY", "List the GitHub PRs whose title or branch names the ticket (JIRA_GITHUB_REPO, else this directory's repo)"
+  def pr(ref)
+    key = jira_key(ref)
+    out, status = Open3.capture2(*jira_pr_list_argv(key))
+    abort "gh pr list failed (is gh signed in, and is this a GitHub repo? JIRA_GITHUB_REPO=OWNER/REPO names one)." unless status.success?
+
+    prs = jira_prs_for(key, JSON.parse(out))
+    abort "No PRs name #{key}." if prs.empty?
+
+    prs.each do |p|
+      puts format("#%-5s %-7s %s → %s  %s\n       %s", p["number"], p["state"], p["headRefName"], p["baseRefName"], p["title"], p["url"])
+    end
+  rescue Errno::ENOENT
+    abort "gh is not installed."
+  end
+end
+
+class Tasks
+  desc "ticket SUBCOMMAND", "Jira tickets: open, show, search, ffind, move, comment, history, remaining, link, attach, create, pr"
+  subcommand "ticket", TicketCommands
+end

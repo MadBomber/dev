@@ -22,11 +22,14 @@
 - [git.loki](https://github.com/MadBomber/dev/blob/main/git.loki): per-repo git basics: `push`, `pull` (fast-forward only), `fetch`
 - [doc_tasks.loki](https://github.com/MadBomber/dev/blob/main/doc_tasks.loki): docs site tasks for a repo with `mkdocs.yml` or `bridgetown.config.yml`: `doc install`, `doc build`, `doc serve`, `doc open`
 - [client/status_report.loki](https://github.com/MadBomber/dev/blob/main/client/status_report.loki): end-of-week client status reporting: `daily_summary` runs every `*_collect` task, `weekly_report` summarizes the week, `shell_hourly` summarizes the last hour of shell commands
+- [client/ticket.loki](https://github.com/MadBomber/dev/blob/main/client/ticket.loki): Jira tickets under `asgard ticket` through jira-cli and the REST API: `show`, `mine`, `search`, `ffind`, `transitions`, `move`, `comment`, `comments`, `history`, `ready`, `children`, `remaining`, `link`, `attach`, `detach`, `create`, `pr`, `browser`; configured by `JIRA_*` environment variables
 - [iterm_tasks.loki](https://github.com/MadBomber/dev/blob/main/iterm_tasks.loki): terminal fixes: `half_duplex_screen_fix`, `clear_scroll_back_buffer`
 - [branch_report.loki](https://github.com/MadBomber/dev/blob/main/branch_report.loki): `branch_report [DAYS]`, a read-only Markdown report with one row per branch, sorted into Active, Stale and Merged; uses `gh` to recognize squash-merged PRs
+- [rails/db.loki](https://github.com/MadBomber/dev/blob/main/rails/db.loki): local PostgreSQL development database under `asgard db`: `status`, `tables`, `psql`, `backup`, `backups`, `dumps`, `restore` (destructive; backs up first, refuses a non-local target), `diff` of two dumps' schemas, `start`, `stop`
 - [rails/db_doc.loki](https://github.com/MadBomber/dev/blob/main/rails/db_doc.loki): tbls schema docs into `notes/dbdoc`: `db_doc`, `db_doc_diff`, `db_doc_mermaid`, `db_doc_open`, `db_doc_clean`
 - [rails/dev.loki](https://github.com/MadBomber/dev/blob/main/rails/dev.loki): background dev stack for a Rails app: `asgard dev up`, `down`, `status` (`bin/dev` plus Mailpit when installed)
 - [runbook.loki](https://github.com/MadBomber/dev/blob/main/runbook.loki): `asgard runbook list` and `asgard runbook show NAME` over the Markdown files in `docs/runbooks`
+- [aws.loki](https://github.com/MadBomber/dev/blob/main/aws.loki): AWS SSO under `asgard aws`: `login`, `logout`, `whoami`, `profiles`, `portal`; a project reopens `AwsCommands` to add its own AWS tasks
 - [fake_aws.loki](https://github.com/MadBomber/dev/blob/main/fake_aws.loki): AWS's local API emulator in Docker, as `fake_aws` subcommands: `build`, `start`, `stop`, `restart`, `status`, `logs`, `version`, `exports`, `smoke`, `remove`
 
 ## Optional

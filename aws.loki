@@ -1,0 +1,234 @@
+# frozen_string_literal: true
+# dev/aws.loki — AWS IAM Identity Center (SSO) sign-in from the command
+# line, so the aws CLI incantations stop living in shell history.
+#
+#   asgard aws login      — SSO sign-in. One login covers every profile that
+#                           shares the SSO session; --profile NAME signs in
+#                           through that profile instead
+#   asgard aws logout     — end the SSO session and clear cached credentials
+#   asgard aws whoami     — caller identity for the profile, and when the SSO
+#                           token expires (alias: id)
+#   asgard aws profiles   — the profiles in the AWS config file: account,
+#                           role and SSO session
+#   asgard aws portal     — open the SSO start page (the AWS access portal)
+#                           in your browser; NO_OPEN=1 just prints the URL
+#
+# Every task takes --profile NAME (default: AWS_PROFILE, else "default") and
+# --sso-session NAME. The session defaults to AWS_SSO_SESSION, else the one
+# the profile names, else the config file's only [sso-session] section.
+# The config file is AWS_CONFIG_FILE, else ~/.aws/config.
+#
+# These tasks only read the config file and run `aws sso` and
+# `aws sts get-caller-identity`. A project adds its own AWS tasks (ECS,
+# logs, parameters) by reopening the group in its .loki after importing
+# this file; aws_json, aws_guard and the helpers below are there to use:
+#
+#   class AwsCommands
+#     desc "services", "List the cluster's ECS services"
+#     def services = puts(aws_json(aws_profile, "ecs", "list-services", "--cluster", "my-app"))
+#   end
+#
+# `portal` calls macOS `open`.
+
+require "json"
+require "open3"
+require "time"
+
+class AwsCommands < Tasks
+  map "id" => "whoami"
+
+  class_option :profile,     type: :string, desc: "AWS profile (default: AWS_PROFILE, else default)"
+  class_option :sso_session, type: :string, desc: "SSO session name (default: AWS_SSO_SESSION, else the profile's, else the config's only one)"
+
+  # ---- pure helpers ---------------------------------------------------------
+
+  # Pure: an AWS config file's text as
+  # { profiles: { name => settings }, sessions: { name => settings } }.
+  # [default] is the profile "default"; [sso-session NAME] sections are the
+  # sessions; any other kind of section ([services ...]) is left out.
+  helper(:aws_parse_config) do |text|
+    parsed  = { profiles: {}, sessions: {} }
+    current = nil
+    text.each_line do |line|
+      line = line.strip
+      next if line.empty? || line.start_with?("#", ";")
+
+      if (m = line.match(/\A\[\s*([^\]]+?)\s*\]\z/))
+        kind, name = m[1].split(/\s+/, 2)
+        current =
+          if name.nil? then kind == "default" ? (parsed[:profiles]["default"] ||= {}) : nil
+          elsif kind == "profile" then parsed[:profiles][name.strip] ||= {}
+          elsif kind == "sso-session" then parsed[:sessions][name.strip] ||= {}
+          end
+      elsif current && (m = line.match(/\A([^=]+?)\s*=\s*(.*)\z/))
+        current[m[1]] = m[2]
+      end
+    end
+    parsed
+  end
+
+  # Pure: the SSO session to use, or nil when none can be chosen:
+  # +wanted+ (--sso-session or AWS_SSO_SESSION), else the session the
+  # profile names, else the config's only session.
+  helper(:aws_pick_session) do |config, profile, wanted|
+    next wanted unless wanted.to_s.strip.empty?
+
+    named = config[:profiles].dig(profile, "sso_session")
+    next named if named
+
+    config[:sessions].size == 1 ? config[:sessions].keys.first : nil
+  end
+
+  # Pure: the SSO start URL for a profile and session: the session's, else
+  # the profile's own (the older config style with no [sso-session]), else nil.
+  helper(:aws_start_url) do |config, profile, session|
+    config[:sessions].dig(session, "sso_start_url") || config[:profiles].dig(profile, "sso_start_url")
+  end
+
+  # Pure: the latest expiresAt (a Time) among SSO cache entries for
+  # start_url, or nil. entries are parsed ~/.aws/sso/cache/*.json hashes.
+  helper(:aws_sso_expiry) do |entries, start_url|
+    entries.select { |e| e["accessToken"] && e["startUrl"] == start_url && e["expiresAt"] }
+           .map { |e| Time.parse(e["expiresAt"]) }
+           .max
+  end
+
+  # Pure: "expires 2026-11-14 17:30 MST (45 min)", "expired 12 min ago", or
+  # "expiry unknown" for the whoami report.
+  helper(:aws_expiry_text) do |expiry, now = Time.now|
+    next "expiry unknown (no cached SSO token for this session)" unless expiry
+
+    minutes = ((expiry - now) / 60).round
+    next "expired #{-minutes} min ago: asgard aws login" if minutes.negative?
+
+    "expires #{expiry.localtime.strftime('%Y-%m-%d %H:%M %Z')} (#{minutes} min)"
+  end
+
+  # Pure: what to try next, read from the aws CLI's stderr.
+  helper(:aws_failure_hint) do |err|
+    if err.match?(/token has expired|sso session|refresh failed|UnauthorizedSSOToken/i)
+      "The SSO session has expired: asgard aws login"
+    elsif err.match?(/AccessDenied|not authorized/i)
+      "The profile's role lacks that permission; try another with --profile."
+    elsif err.match?(/could not be found|ProfileNotFound/i)
+      "No such profile: asgard aws profiles lists them."
+    else
+      "See the aws error above."
+    end
+  end
+
+  # Pure: the profiles table for `profiles`, one line per profile.
+  helper(:aws_profile_lines) do |profiles|
+    width = [profiles.keys.map(&:length).max.to_i, "profile".length].max
+    row   = ->(cells) { format("%-#{width}s  %-14s %-32s %s", *cells).rstrip }
+    [row.(%w[profile account role sso-session]),
+     *profiles.map { |name, cfg| row.([name, cfg["sso_account_id"] || "-", cfg["sso_role_name"] || "-", cfg["sso_session"] || "-"]) }]
+  end
+
+  # ---- AWS plumbing ---------------------------------------------------------
+
+  helper(:aws_guard) do
+    abort "aws CLI not found — install AWS CLI v2 (e.g. brew install awscli)." unless system("which", "aws", out: File::NULL, err: File::NULL)
+  end
+
+  helper(:aws_config_path) { ENV.fetch("AWS_CONFIG_FILE") { File.expand_path("~/.aws/config") } }
+
+  # The parsed AWS config file; aborts when there is none.
+  helper(:aws_config) do
+    path = aws_config_path
+    abort "#{path} is missing — create it with `aws configure sso`, or point AWS_CONFIG_FILE at one." unless File.file?(path)
+    aws_parse_config(File.read(path))
+  end
+
+  # Plain methods, not helpers: a helper runs on the class, where `options`
+  # is not the running task's.
+  no_commands do
+    # The profile these tasks act on.
+    def aws_profile = options[:profile] || ENV.fetch("AWS_PROFILE", "default")
+
+    # The SSO session these tasks act on, or nil.
+    def aws_session(config = aws_config)
+      aws_pick_session(config, aws_profile, options[:sso_session] || ENV.fetch("AWS_SSO_SESSION", nil))
+    end
+  end
+
+  # Parsed ~/.aws/sso/cache/*.json entries; unreadable files are skipped.
+  helper(:aws_sso_cache) do |dir = File.expand_path("~/.aws/sso/cache")|
+    Dir[File.join(dir, "*.json")].filter_map do |file|
+      JSON.parse(File.read(file))
+    rescue JSON::ParserError, SystemCallError
+      nil
+    end
+  end
+
+  # Runs `aws ARGS --profile P --output json` and returns the parsed JSON,
+  # or aborts with the CLI's error and a hint.
+  helper(:aws_json) do |profile, *args|
+    out, err, status = Open3.capture3("aws", *args, "--profile", profile, "--output", "json")
+    unless status.success?
+      $stderr.puts err.strip
+      abort "aws #{args.first(2).join(' ')} failed with profile #{profile}. #{aws_failure_hint(err)}"
+    end
+    out.strip.empty? ? nil : JSON.parse(out)
+  end
+
+  # ---- tasks ----------------------------------------------------------------
+
+  desc "login", "AWS SSO sign-in (one login covers every profile sharing the session; --profile signs in through one)"
+  def login
+    aws_guard
+    session = options[:profile] ? nil : aws_session
+    argv = session ? ["--sso-session", session] : ["--profile", aws_profile]
+    system("aws", "sso", "login", *argv) || abort("aws sso login failed.")
+  end
+
+  desc "logout", "End the SSO session and clear cached credentials"
+  def logout
+    aws_guard
+    system("aws", "sso", "logout") || abort("aws sso logout failed.")
+    puts "Signed out of AWS SSO."
+  end
+
+  desc "whoami", "Caller identity for the profile and when the SSO token expires (alias: id)"
+  def whoami
+    aws_guard
+    config  = aws_config
+    profile = aws_profile
+    session = aws_session(config)
+    ident   = aws_json(profile, "sts", "get-caller-identity")
+    expiry  = aws_sso_expiry(aws_sso_cache, aws_start_url(config, profile, session))
+
+    puts <<~INFO
+      Profile : #{profile}
+      Account : #{ident['Account']}
+      ARN     : #{ident['Arn']}
+      Session : #{session || '-'}
+      SSO     : #{aws_expiry_text(expiry)}
+    INFO
+  end
+
+  desc "profiles", "Profiles in the AWS config file with their account, role and SSO session"
+  def profiles
+    found = aws_config[:profiles]
+    abort "No profiles in #{aws_config_path}." if found.empty?
+
+    puts aws_profile_lines(found)
+  end
+
+  desc "portal", "Open the SSO start page (the AWS access portal) in your browser"
+  def portal
+    config  = aws_config
+    session = aws_session(config)
+    url = aws_start_url(config, aws_profile, session) ||
+          abort("No sso_start_url for #{session ? "sso-session #{session}" : "profile #{aws_profile}"} in #{aws_config_path}. " \
+                "Name a session with --sso-session, or a profile with --profile.")
+    return puts(url) if ENV["NO_OPEN"]
+
+    system("open", url) || abort("Could not open #{url}")
+  end
+end
+
+class Tasks
+  desc "aws SUBCOMMAND", "AWS SSO: login, logout, whoami, profiles, portal"
+  subcommand "aws", AwsCommands
+end
