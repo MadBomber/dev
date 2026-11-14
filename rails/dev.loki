@@ -1,0 +1,122 @@
+# frozen_string_literal: true
+# dev/rails/dev.loki — background lifecycle for a Rails app's local dev stack.
+# Import it with `import_up "dev/rails/*.loki"`.
+#
+#   asgard dev up     (alias: start) — bin/dev (Foreman: web server, CSS/JS
+#                                      watchers, job worker) and, when it is
+#                                      installed, Mailpit; both detached,
+#                                      stdout/stderr appended to log/
+#   asgard dev down   (alias: stop)  — stop them again
+#   asgard dev status                — what is running
+#
+# Run from the app's root. Mailpit (`brew install mailpit`) catches the
+# mail the app sends in development; without it `up` starts bin/dev alone.
+# DEV_SERVER_COMMAND replaces bin/dev (e.g. "bin/rails server").
+
+require "fileutils"
+
+class DevCommands < Tasks
+  @@dev_command      ||= ENV.fetch("DEV_SERVER_COMMAND", "bin/dev")
+  @@dev_log          ||= "log/development.log"
+  @@mailpit_log      ||= "log/mailpit.log"
+  @@dev_pid_file     ||= "tmp/pids/dev_server.pid"
+  @@mailpit_pid_file ||= "tmp/pids/mailpit.pid"
+
+  map "start" => "up", "stop" => "down"
+
+  # Mailpit is found by name (we may not have been the one to start it).
+  helper(:mailpit_pid) do
+    pid = `pgrep -x mailpit`.split.first
+    pid&.to_i
+  end
+
+  helper(:mailpit_installed?) { system("which", "mailpit", out: File::NULL, err: File::NULL) }
+
+  # Pid from a pid file, nil (and the stale file cleaned up) when that
+  # process is no longer alive.
+  helper(:live_pid_from) do |pid_file|
+    next nil unless File.exist?(pid_file)
+
+    pid = File.read(pid_file).to_i
+    begin
+      Process.kill(0, pid)
+      pid
+    rescue Errno::ESRCH, Errno::EPERM
+      File.delete(pid_file)
+      nil
+    end
+  end
+
+  helper(:dev_server_pid) { live_pid_from(@@dev_pid_file) }
+
+  # Detach a command into its own process group with output appended to
+  # log_file; returns the pid (== the process-group id).
+  helper(:spawn_background) do |command, log_file|
+    pid = Process.spawn(command, %i[out err] => [log_file, "a"], pgroup: true)
+    Process.detach(pid)
+    pid
+  end
+
+  desc "up", "Start #{@@dev_command} (and Mailpit, when installed) in the background (alias: start)"
+  def up
+    executable = @@dev_command.split.first
+    abort "#{executable} not found — run this from the Rails app's root." unless File.exist?(executable)
+
+    FileUtils.mkdir_p("log")
+    FileUtils.mkdir_p("tmp/pids")
+
+    if (pid = mailpit_pid)
+      File.write(@@mailpit_pid_file, pid.to_s) # adopt it so `dev down` can stop it
+      puts "Mailpit already running (pid #{pid})."
+    elsif mailpit_installed?
+      pid = spawn_background("mailpit", @@mailpit_log)
+      File.write(@@mailpit_pid_file, pid.to_s)
+      puts "Mailpit started (pid #{pid}, log → #{@@mailpit_log})."
+    else
+      puts "Mailpit not installed (brew install mailpit) — starting the dev server without it."
+    end
+
+    if (pid = dev_server_pid)
+      puts "Dev server already running (pid #{pid})."
+    else
+      pid = spawn_background(@@dev_command, @@dev_log)
+      File.write(@@dev_pid_file, pid.to_s)
+      puts "Dev server started (pid #{pid}, log → #{@@dev_log})."
+    end
+  end
+
+  desc "down", "Stop the background dev server and Mailpit (alias: stop)"
+  def down
+    if (pid = dev_server_pid)
+      Process.kill("TERM", -pid) # the whole process group: web, css, jobs
+      File.delete(@@dev_pid_file)
+      puts "Dev server stopped (pid #{pid})."
+    else
+      puts "Dev server not running."
+    end
+
+    if (pid = live_pid_from(@@mailpit_pid_file))
+      Process.kill("TERM", pid)
+      File.delete(@@mailpit_pid_file)
+      puts "Mailpit stopped (pid #{pid})."
+    elsif (pid = mailpit_pid)
+      Process.kill("TERM", pid) # not started by `dev up`, found via pgrep
+      puts "Mailpit stopped (pid #{pid}, was not started by dev up)."
+    else
+      puts "Mailpit not running."
+    end
+  end
+
+  desc "status", "Show whether the dev server and Mailpit are running"
+  def status
+    server  = dev_server_pid
+    mailpit = live_pid_from(@@mailpit_pid_file) || mailpit_pid
+    puts "Dev server: #{server ? "running (pid #{server}, log → #{@@dev_log})" : 'not running'}"
+    puts "Mailpit:    #{mailpit ? "running (pid #{mailpit})" : 'not running'}"
+  end
+end
+
+class Tasks
+  desc "dev SUBCOMMAND", "Local Rails dev stack: bin/dev and Mailpit in the background"
+  subcommand "dev", DevCommands
+end

@@ -1,0 +1,71 @@
+# frozen_string_literal: true
+# dev/runbook.loki — a discovery layer over a repo's operational runbooks:
+# list them, read one by partial name. Judgment-heavy or destructive
+# procedures are better left as prose than automated; this makes them one
+# memorable command away.
+#
+#   asgard runbook list          — list the runbooks with their titles
+#   asgard runbook show NAME     — read one by (partial) name
+#
+# Runbooks are the Markdown files in docs/runbooks (README.md is left out).
+# A repo that keeps them elsewhere sets RUNBOOKS_DIR, or assigns
+# @@runbooks_dir in its own .loki before importing this file.
+
+require "shellwords"
+
+class RunbookCommands < Tasks
+  @@runbooks_dir ||= ENV.fetch("RUNBOOKS_DIR", "docs/runbooks")
+
+  # The runbook files in +dir+, sorted; README.md is the directory's index,
+  # not a runbook.
+  helper(:runbook_files) do |dir = @@runbooks_dir|
+    Dir[File.join(dir, "*.md")].reject { |f| File.basename(f) == "README.md" }.sort
+  end
+
+  # First H1 of a runbook, as its human-readable title.
+  helper(:runbook_title) do |path|
+    File.foreach(path).find { |l| l.start_with?("# ") }&.delete_prefix("# ")&.strip || File.basename(path)
+  end
+
+  # Pure: the +files+ whose name contains +name+: a case-insensitive
+  # substring match over the filename, with - and _ treated as equal.
+  helper(:runbook_matches) do |name, files = runbook_files|
+    needle = name.to_s.downcase.tr("_", "-")
+    files.select { |f| File.basename(f, ".md").downcase.tr("_", "-").include?(needle) }
+  end
+
+  # argv of the pager for +file+: glow when installed, else $PAGER, else less.
+  helper(:runbook_pager) do |file, glow = system("which", "glow", out: File::NULL, err: File::NULL)|
+    glow ? ["glow", "-p", file] : [*Shellwords.split(ENV.fetch("PAGER", "less")), file]
+  end
+
+  desc "list", "List the operational runbooks"
+  def list
+    files = runbook_files
+    abort "No runbooks (*.md) in #{@@runbooks_dir}. Set RUNBOOKS_DIR if they live elsewhere." if files.empty?
+
+    width = files.map { |f| File.basename(f, ".md").length }.max
+    files.each { |f| puts format("%-#{width}s  %s", File.basename(f, ".md"), runbook_title(f)) }
+    puts "", "Read one:  asgard runbook show <part-of-name>"
+  end
+
+  desc "show NAME", "Read a runbook by (partial) name"
+  def show(name)
+    matches = runbook_matches(name)
+    abort "No runbook matches #{name.inspect}. Run: asgard runbook list" if matches.empty?
+    if matches.size > 1
+      abort "#{name.inspect} is ambiguous — it matches:\n#{matches.map { |f| "  #{File.basename(f, '.md')}" }.join("\n")}"
+    end
+
+    # Off a terminal (a pipe, a script) a pager would wait for keys nobody
+    # can press, so the file is printed as it is.
+    return puts(File.read(matches.first)) unless $stdout.tty?
+
+    system(*runbook_pager(matches.first)) || abort("Could not open #{matches.first}")
+  end
+end
+
+class Tasks
+  desc "runbook SUBCOMMAND", "Operational runbooks: list and read"
+  subcommand "runbook", RunbookCommands
+end

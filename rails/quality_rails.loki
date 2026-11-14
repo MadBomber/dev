@@ -11,14 +11,16 @@
 # `quality` (in quality.loki) discovers every *_check task at run time by
 # introspecting Tasks.all_commands, rather than a fixed depends_on list — so
 # any *_check task defined here is automatically picked up by `asgard
-# quality` too, with no need to redeclare or extend anything.
+# quality` too, with no need to redeclare or extend anything. Each gate
+# reports through run_gate / skip_gate (quality.loki), which settle the
+# gate's row on the live quality board.
 #
 # Note on rubocop-rails: it's a RuboCop plugin, not a standalone CLI, so it
 # has no *_check task of its own here. Add the gem to the app's Gemfile and
 # `require: rubocop-rails` in its .rubocop.yml — the existing rubocop_check
 # (quality.loki) picks up the added Rails cops automatically.
 
-# bundled_gem? lives in ../quality.loki. Importing it here lets a project load
+# bundled_gem?, run_gate and skip_gate live in ../quality.loki. Importing it here lets a project load
 # the Rails gates on their own. The guard, not just import's own
 # already-loaded check, keeps it to one load when dev/ is reached through
 # a symlink: import resolves this file's relative path to the real one, a
@@ -28,58 +30,35 @@ import "../quality.loki" unless Tasks.method_defined?(:bundled_gem?)
 class Tasks
   desc "Check for Rails security vulnerabilities with Brakeman"
   def brakeman_check
-    return skip_brakeman unless bundled_gem?("brakeman")
+    return skip_gate(:brakeman, "Brakeman", not_bundled_hint("brakeman")) unless bundled_gem?("brakeman")
 
-    output = `bundle exec brakeman -q 2>&1`
-    result = $?.success? ? :pass : :fail
-    File.write("brakeman_output.txt", output)
-    summary = output.lines.reverse.find { |l| l =~ /warnings? found/i }&.strip || result.to_s
-    puts "Brakeman: #{summary} (see brakeman_output.txt)"
-    result
+    run_gate(:brakeman, "Brakeman", "bundle exec brakeman -q", summary: /warnings? found/i)
   end
 
   desc "Check for Rails anti-patterns with RailsBestPractices"
   def rails_best_practices_check
-    return skip_rails_best_practices unless bundled_gem?("rails_best_practices")
+    unless bundled_gem?("rails_best_practices")
+      return skip_gate(:rails_best_practices, "RailsBestPractices", not_bundled_hint("rails_best_practices"))
+    end
 
-    output = `bundle exec rails_best_practices --silent --without-color . 2>&1`
-    result = $?.success? ? :pass : :fail
-    File.write("rails_best_practices_output.txt", output)
-    summary = output.lines.reverse.find { |l| l =~ /warning/i }&.strip || result.to_s
-    puts "RailsBestPractices: #{summary} (see rails_best_practices_output.txt)"
-    result
+    run_gate(:rails_best_practices, "RailsBestPractices",
+             "bundle exec rails_best_practices --silent --without-color .", summary: /warning/i)
   end
 
-  desc "Check for database schema issues with ActiveRecordDoctor"
-  def active_record_doctor_check
-    return skip_active_record_doctor unless bundled_gem?("active_record_doctor")
-
-    output = `bundle exec rake active_record_doctor 2>&1`
-    result = $?.success? ? :pass : :fail
-    File.write("active_record_doctor_output.txt", output)
-    issue_count = output.lines.count { |l| l.strip != "" }
-    summary = result == :pass ? "no issues found" : "#{issue_count} issue line(s) found"
-    puts "ActiveRecordDoctor: #{summary} (see active_record_doctor_output.txt)"
-    result
-  end
-
-  no_commands do
-    def skip_brakeman
-      puts "Brakeman: SKIPPED — brakeman is not in this repo's bundle. " \
-        "Add it to the Gemfile's development group to enable this gate."
-      :skip
+  # Advisory: a finding is a schema suggestion to weigh (silence the tool's
+  # false positives in the app's .active_record_doctor.rb), not a failure of
+  # the change under review, so findings report :warn. Named ard_check, not
+  # active_record_doctor_check, to keep the board's rows short; its output
+  # goes to ard_output.txt.
+  desc "Check for database schema issues with ActiveRecordDoctor (advisory)"
+  def ard_check
+    unless bundled_gem?("active_record_doctor")
+      return skip_gate(:ard, "ActiveRecordDoctor", not_bundled_hint("active_record_doctor"))
     end
 
-    def skip_rails_best_practices
-      puts "RailsBestPractices: SKIPPED — rails_best_practices is not in this repo's bundle. " \
-        "Add it to the Gemfile's development group to enable this gate."
-      :skip
-    end
-
-    def skip_active_record_doctor
-      puts "ActiveRecordDoctor: SKIPPED — active_record_doctor is not in this repo's bundle. " \
-        "Add it to the Gemfile's development group to enable this gate."
-      :skip
-    end
+    run_gate(:ard, "ActiveRecordDoctor", "bundle exec rake active_record_doctor", on_fail: :warn,
+             summary: lambda { |output, result|
+               result == :pass ? "no issues found" : "#{output.lines.count { |l| l.strip != "" }} issue line(s) found"
+             })
   end
 end

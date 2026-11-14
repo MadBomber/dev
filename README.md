@@ -75,8 +75,8 @@ whose `push` also pushes tags).
 
   | Tool | Used by | Install |
   |------|---------|---------|
-  | `gh` (authenticated) | `github_collect` | `brew install gh`, then `gh auth login` |
-  | `claude` | `weekly_report` | Claude Code CLI, then `claude /login` once |
+  | `gh` (authenticated) | `github_collect`; PR linkage in `branch_report` | `brew install gh`, then `gh auth login` |
+  | `claude` | `weekly_report`, `shell_hourly` | Claude Code CLI, then `claude /login` once |
   | `icalBuddy` | `calendar_collect` | `brew install ical-buddy` |
   | `tbls`, `pg_isready` | `db_doc*` tasks | `brew install k1LoW/tap/tbls`; PostgreSQL client tools |
   | `docker` | `fake_aws` tasks | Docker Desktop, or any Docker engine |
@@ -94,14 +94,16 @@ whose `push` also pushes tags).
 |------|----------|
 | `.loki` | Imports every top-level `*.loki` file below (not `rails/` or `client/`), for `import_up "dev/.loki"` |
 | `gem_tasks.loki` | Gem lifecycle: `console`, `build`, `install`, `release` |
-| `quality.loki` | The `quality` gate and the `*_check` tasks it runs |
+| `quality.loki` | The `quality` gate and the `*_check` tasks it runs (`quality/` holds its RSpec progress listener) |
 | `rails/quality_rails.loki` | Rails-only checks: Brakeman, RailsBestPractices, ActiveRecordDoctor |
 | `git.loki` | Per-repo git basics: `push`, `pull` (ff-only), `fetch` |
 | `doc_tasks.loki` | Documentation site tasks, for a repo with `mkdocs.yml` or `bridgetown.config.yml`: `doc install`, `doc build`, `doc serve`, `doc open` |
-| `client/status_report.loki` | End-of-week client status reporting: `daily_summary`, `weekly_report` |
+| `client/status_report.loki` | End-of-week client status reporting: `daily_summary`, `weekly_report`, `shell_hourly` |
 | `iterm_tasks.loki` | Terminal fixes: `half_duplex_screen_fix`, `clear_scroll_back_buffer` |
-| `branch_report.loki` | `branch_report [DAYS]`: read-only table of every local and remote branch (ahead/behind and merged measured against `origin/<default>` as of the last fetch, else the local default), then the ones idle (or merged and idle) over DAYS, default 30 |
+| `branch_report.loki` | `branch_report [DAYS]`: read-only Markdown report with one row per branch (local and origin copies together), sorted into Active, Stale (idle over DAYS, default 30) and Merged. Uses `gh`, when available, to recognize squash- and rebase-merged PRs |
 | `rails/db_doc.loki` | [tbls](https://github.com/k1LoW/tbls) schema docs into `notes/dbdoc` (needs Postgres up on localhost:5432; `DB_DOC_DSN` overrides the default vbr_development DSN): `db_doc`, `db_doc_diff`, `db_doc_mermaid`, `db_doc_open`, `db_doc_clean` |
+| `rails/dev.loki` | Background dev stack for a Rails app: `asgard dev up`, `down`, `status` (`bin/dev`, plus Mailpit when installed) |
+| `runbook.loki` | Operational runbooks in `docs/runbooks` (or `RUNBOOKS_DIR`): `asgard runbook list`, `asgard runbook show NAME` |
 | `fake_aws.loki` | AWS's local API emulator in Docker (its Dockerfile and smoke test are in `fake_aws/`): `asgard fake_aws build`, `start`, `stop`, `restart`, `status`, `logs`, `version`, `exports`, `smoke`, `remove` |
 | `rubocop-strict.yml` | Cops kept enabled with no exclusions over `.rubocop_todo.yml` (when inherited after it; see below) |
 
@@ -143,11 +145,46 @@ counts grandfathered in `.quality/reek_baseline.txt`. Its companion task,
 `asgard reek_baseline` when a regression is intentional (or to ratchet the
 counts down after a cleanup).
 
+**Live board.** On a terminal, with the `tty-spinner` gem installed for
+asgard's Ruby (`gem install tty-spinner`), `quality` draws one spinner row
+per gate and each gate settles its row with a badge and a one-line note as
+it finishes. Off a terminal (CI, a pipe) or without the gem, each gate
+prints a `Label: note` line and the summary lists every gate, as before.
+
+**test_check picks its runner.** `bundle exec rake test` by default;
+`bundle exec rspec` when the repo has `spec/` and bundles `rspec-core`;
+`bundle exec parallel_rspec` when it also bundles `parallel_tests`. Both
+RSpec runs set `COVERAGE=true`. The parallel run uses
+`PARALLEL_TEST_PROCESSORS` processes (default: CPU count, at most 8, never
+more than there are spec files) and, on the live board, shows a progress
+bar fed by `quality/test_progress_listener.rb`, which is loaded through
+`SPEC_OPTS` so the app carries no code for it. A Rails app needs its
+per-process test databases first: `bin/rails parallel:prepare`.
+
+**A gate that raises is a FAIL, not a crash.** An exception out of any
+`*_check` task is written with its backtrace to that gate's `*_output.txt`
+and the gate reports FAIL, so the other gates' results and the summary
+still print. `GATE_CRASH_STATUS` in `quality.loki` sets that status.
+
+**Project Ruby.** When the repo has a `.ruby-version` and rbenv has that
+version, `bundle exec` gates run on it rather than on asgard's Ruby, which
+would otherwise fail on bundler's Ruby version check.
+
+**Writing a gate.** A new `*_check` task reports through the helpers here
+instead of printing: `run_gate(name, label, command, summary:)` runs a
+command, saves its output and settles the row; `report_gate` does the same
+for output the task produced itself; `skip_gate(name, label, reason)`
+reports SKIP. A gate that calls `puts` breaks the live board's layout.
+
 ### rails/quality_rails.loki
 
 Rails-specific `*_check` gates, gated on `RAILS_ROOT` (set in a Rails repo's
 `.envrc`) rather than `defined?(Rails)`, since Asgard runs outside the app's
 process. Once imported, its checks are picked up by `quality` automatically.
+
+ActiveRecordDoctor is advisory: its findings report WARN, never FAIL. Its
+task is `ard_check` (it was `active_record_doctor_check`) and its output
+goes to `ard_output.txt`.
 
 ### client/status_report.loki
 
@@ -162,17 +199,84 @@ Each collector is best-effort and never fails the run — a missing tool or
 unset env var just prints a SKIP line instead of aborting the others:
 
 - `notes_collect` — `_notes.txt` journal entries (no config needed)
-- `git_collect` — `git log`, scoped to `git config user.email`
+- `git_collect` — `git log --all` (every branch, not only the one checked
+  out), scoped to `git config user.email`
 - `github_collect` — needs `gh` authenticated (`gh auth status`)
 - `jira_collect` — needs `JIRA_SITE`, `JIRA_PROJECT`, `JIRA_USER_EMAIL`,
   `JIRA_API_KEY`
 - `claude_sessions_collect` — reads `~/.claude/projects/<repo>/*.jsonl`
-- `shell_history_collect` — needs `HISTTIMEFORMAT` set so
-  `~/.bash_history` carries timestamps
+- `shell_history_collect` — the day's `shell_hourly` summaries when there
+  are any, otherwise the day's commands from `~/.bash_history`. Only
+  commands bash saved with a timestamp are found, so set `HISTTIMEFORMAT`
+  in your shell profile
 - `calendar_collect` — needs `icalBuddy` (`brew install ical-buddy`)
 
 Add a source by defining another `*_collect` task; nothing else needs to
 be redeclared.
+
+`git_collect` and `github_collect` cover the repo at `RR` by default. For a
+project whose work is spread over several clones, list the others in
+`STATUS_REPO_DIRS`, separated by `:` (relative paths are resolved against
+`RR`); each repo then gets its own heading in the day's file:
+
+```bash
+export STATUS_REPO_DIRS="branches/working:../shared-library"
+```
+
+`shell_hourly` summarizes the clock hour that just ended: it sends that
+hour's shell commands to `claude -p` and writes a one-to-three sentence
+summary to `notes/_status/shell/<date>/<HH>00-<HH+1>00.md`. Lines that look
+like a secret assignment (`_KEY=`, `_TOKEN=`, `_SECRET=`, `PASSWORD=`) are
+left out before anything is sent. It is meant to be scheduled from the
+project's `.loki`:
+
+```ruby
+schedule :shell_hourly, at: %w[10:00 11:00 12:00 13:00 14:00 15:00 16:00 17:00], on: :weekdays
+```
+
+`STATUS_DATE=2026-09-29 STATUS_HOUR=14 asgard shell_hourly` redoes one hour.
+
+### branch_report.loki
+
+`asgard branch_report [DAYS]` prints a Markdown report of every branch
+except the default one. A branch and its `origin/` copy share a row, and
+when both exist the newer tip is the one measured. Each row lands in one
+bucket:
+
+- **Active**: an open PR, or a commit within DAYS (default 30)
+- **Stale**: unmerged, no open PR, idle for over DAYS
+- **Merged**: the tip is in `origin/<default>` as of the last fetch, or a
+  PR from the branch was merged and the branch has not moved since
+
+The PR check needs `gh` authenticated for the repo, and is what recognizes
+squash and rebase merges; without `gh` the report says so and uses git
+ancestry alone. A long-lived branch such as `develop` counts as merged
+only until it gets its next commit. The task never fetches, deletes or
+pushes; run `git fetch --prune` first for current data.
+
+A branch with no PR of its own can be matched to one by ticket id: set
+`BRANCH_TICKET_PATTERN` to a regular expression such as `PROJ-\d+`, or
+`JIRA_PROJECT`, from which `<JIRA_PROJECT>-<number>` is built.
+
+### runbook.loki
+
+A discovery layer over a repo's operational runbooks, the Markdown files
+in `docs/runbooks` (`README.md` is left out). `asgard runbook list` prints
+each file's name and its first heading; `asgard runbook show NAME` opens
+the one whose name contains NAME (case-insensitive, `-` and `_` treated
+alike) in `glow` when installed, else `$PAGER`, else `less`. Off a terminal
+it prints the file instead. Set `RUNBOOKS_DIR` when the runbooks live
+somewhere else.
+
+### rails/dev.loki
+
+`asgard dev up` (alias `start`) starts `bin/dev` in the background, with
+its output appended to `log/development.log` and its pid in
+`tmp/pids/dev_server.pid`. When Mailpit is installed it is started too
+(or adopted, if already running) to catch the mail the app sends in
+development. `asgard dev down` (alias `stop`) stops both, and
+`asgard dev status` shows what is running. Run them from the app's root;
+`DEV_SERVER_COMMAND` replaces `bin/dev`.
 
 ### Scheduled tasks
 

@@ -1,12 +1,26 @@
-# Status of every local and remote branch: last activity, ahead/behind the
-# default branch, and merge state — so stale and already-merged branches are
-# easy to spot before cleanup. Read-only; never deletes, pushes, or fetches.
+# frozen_string_literal: true
+# Status of every branch — the local and origin copies of a branch merged
+# into one row — sorted into the buckets a cleanup pass cares about:
+# Active, Stale and Merged. GitHub PR state (through `gh`, when it is
+# installed and authenticated for the repo) catches squash and rebase
+# merges, which leave a branch's tip outside the default branch's history
+# so `git merge-base --is-ancestor` alone reports them as unmerged. A
+# merged PR counts only while its last commit is still the branch's tip, so
+# a long-lived branch with new commits is not called merged.
+# Read-only; never deletes, pushes, or fetches.
 #
 #   asgard branch_report          # 30-day threshold
 #   asgard branch_report 45       # custom threshold, in days
+#
+# A branch that never had a PR of its own can still be matched to one by
+# ticket id: set BRANCH_TICKET_PATTERN to a regular expression (e.g.
+# "PROJ-\d+"), or JIRA_PROJECT, from which "<JIRA_PROJECT>-<number>" is
+# built. With neither set, PRs are matched by branch name only.
 
 require "date"
+require "json"
 require "open3"
+require "time"
 
 class Tasks
   DEFAULT_STALE_DAYS = 30
@@ -14,6 +28,14 @@ class Tasks
   helper(:branch_capture) do |*args|
     out, status = Open3.capture2("git", *args, err: File::NULL)
     [out, status.success?]
+  end
+
+  # [stdout, succeeded?] of `gh ARGS`; a missing gh counts as a failure.
+  helper(:branch_capture_gh) do |*args|
+    out, status = Open3.capture2("gh", *args, err: File::NULL)
+    [out, status.success?]
+  rescue Errno::ENOENT
+    ["", false]
   end
 
   # "origin/main" -> "main". Falls back to whichever of main/master exists
@@ -28,28 +50,27 @@ class Tasks
 
   # rev-list/merge-base need a ref that actually resolves: prefer origin's
   # copy, so a branch merged on the server reads as merged once fetched
-  # (no pull needed; this task never fetches), and the local default row
-  # shows how far it has drifted.
+  # (no pull needed; this task never fetches).
   # Falls back to the local branch when origin has no such ref.
   helper(:branch_resolvable_base) do |name|
     _, ok = branch_capture("rev-parse", "--verify", "--quiet", "refs/remotes/origin/#{name}")
     ok ? "origin/#{name}" : name
   end
 
-  # One row per ref under prefix: name, last-commit epoch/date, author.
+  # One row per ref under prefix: name, tip sha, last-commit epoch/date, author.
   # Fields are NUL-separated: branch and author names may contain "|", but
   # neither can contain NUL.
   # Drops symbolic refs (origin/HEAD) — not a real branch. Its short name
   # abbreviates to the bare remote name ("origin", not "origin/HEAD"), so
   # this filters on %(symref) rather than a "/HEAD" suffix match.
   helper(:branch_rows) do |ref_prefix|
-    fmt = "%(symref)%00%(refname:short)%00%(committerdate:unix)%00%(committerdate:short)%00%(authorname)"
+    fmt = "%(symref)%00%(refname:short)%00%(objectname)%00%(committerdate:unix)%00%(committerdate:short)%00%(authorname)"
     out, = branch_capture("for-each-ref", ref_prefix, "--format=#{fmt}")
     out.each_line.filter_map do |line|
-      symref, name, epoch, date, author = line.chomp.split("\0", 5)
+      symref, name, sha, epoch, date, author = line.chomp.split("\0", 6)
       next unless symref.to_s.empty?
 
-      { name: name, epoch: epoch.to_i, date: date, author: author.to_s }
+      { name: name, sha: sha, epoch: epoch.to_i, date: date, author: author.to_s }
     end
   end
 
@@ -57,12 +78,6 @@ class Tasks
   # Markdown table cell instead of splitting the row.
   helper(:branch_cell) do |text|
     text.to_s.gsub("|", "\\|")
-  end
-
-  # The default branch itself, local or remote ("main", "origin/main"), is
-  # never listed as merged or idle.
-  helper(:branch_default?) do |name, default_name|
-    [default_name, "origin/#{default_name}"].include?(name)
   end
 
   helper(:branch_ahead_behind) do |name, base|
@@ -78,7 +93,197 @@ class Tasks
     ok
   end
 
-  desc "Status of every local/remote branch, as Markdown: activity, ahead/behind, merge state vs. the default branch (days: staleness threshold, default #{DEFAULT_STALE_DAYS})"
+  # Date of the first commit unique to this branch (base..ref), i.e. when
+  # it diverged. nil for a branch whose tip is already in base: there is no
+  # unique history left to date.
+  helper(:branch_created_date) do |ref, base|
+    out, ok = branch_capture("log", "#{base}..#{ref}", "--reverse", "--format=%cd", "--date=short")
+    next nil unless ok
+
+    out.each_line.first&.strip
+  end
+
+  # [prs, available?]: every PR (any state) opened from a branch of this
+  # repo, in one `gh` call instead of one per branch. PRs from forks are
+  # left out, since a fork's branch can share a name with one here.
+  # available? is false when `gh` is missing, unauthenticated, or this
+  # isn't a GitHub repo, so the report can say merge state is git-only
+  # rather than read "no PRs found" as "nothing was merged".
+  helper(:branch_pull_requests) do
+    out, ok = branch_capture_gh("pr", "list", "--state", "all", "--limit", "1000", "--json",
+                                "number,headRefName,headRefOid,baseRefName,state,url,createdAt,title,isCrossRepository")
+    next [[], false] unless ok
+
+    [JSON.parse(out).reject { |pr| pr["isCrossRepository"] }, true]
+  rescue JSON::ParserError
+    [[], false]
+  end
+
+  # Pure: the Regexp that finds a ticket id in a branch name or PR title,
+  # from BRANCH_TICKET_PATTERN, else "<JIRA_PROJECT>-<number>", else nil
+  # (no ticket matching).
+  helper(:branch_ticket_pattern) do |pattern = ENV.fetch("BRANCH_TICKET_PATTERN", nil), project = ENV.fetch("JIRA_PROJECT", nil)|
+    next Regexp.new(pattern, Regexp::IGNORECASE) unless pattern.to_s.empty?
+    next nil if project.to_s.empty?
+
+    /#{Regexp.escape(project)}-\d+/i
+  end
+
+  # Pure: the ticket id in +text+, upper-cased ("proj-87-solid" -> "PROJ-87"),
+  # or nil when there is no pattern or no match.
+  helper(:branch_ticket_id) do |text, pattern = branch_ticket_pattern|
+    pattern && text.to_s[pattern]&.upcase
+  end
+
+  # Pure: true when one of +prs+ was merged with +sha+ as its last commit,
+  # i.e. the branch has not moved since that merge. A long-lived branch
+  # (develop) that had a PR merged and then gained new commits has a
+  # different tip, so its old MERGED PRs do not make it "merged".
+  helper(:branch_pr_merged?) do |prs, sha|
+    prs.any? { |pr| pr["state"] == "MERGED" && pr["headRefOid"] == sha }
+  end
+
+  # Pure: the bucket a branch belongs in. An open PR wins even over a
+  # "merged" verdict: a rolling branch a bot reuses can carry both a pile
+  # of past MERGED PRs and a live OPEN one — that's still work in flight,
+  # not something safe to delete.
+  helper(:branch_status) do |open_pr, merged, idle_days, threshold|
+    next :active if open_pr
+    next :merged if merged
+
+    idle_days <= threshold ? :active : :stale
+  end
+
+  # Pure: the Pull Request(s) cell for a row. A PR whose base is not the
+  # default branch says where it went ("Merged into `develop`").
+  helper(:branch_pr_cell) do |prs, same_ticket = false, default_name = nil|
+    next "—" if prs.empty?
+
+    prs.map do |pr|
+      into = pr["baseRefName"] && pr["baseRefName"] != default_name ? " into `#{branch_cell(pr["baseRefName"])}`" : ""
+      "[##{pr["number"]}](#{pr["url"]}) (#{pr["state"].capitalize}#{into}#{", same ticket" if same_ticket})"
+    end.join("<br>")
+  end
+
+  # Pure: { logical name => { local:, remote: } } from branch_rows of
+  # refs/heads and refs/remotes. A branch and its origin/ copy share one
+  # entry. A ref on another remote keeps its full name ("upstream/x") as
+  # its own entry, since it is not known to be the same branch.
+  helper(:branch_logical) do |local_rows, remote_rows|
+    merged = Hash.new { |hash, key| hash[key] = {} }
+    local_rows.each { |row| merged[row[:name]][:local] = row }
+    remote_rows.each do |row|
+      merged[row[:name].start_with?("origin/") ? row[:name].delete_prefix("origin/") : row[:name]][:remote] = row
+    end
+    merged
+  end
+
+  # One report row for a logical branch. The newer of the local and remote
+  # tips is the one measured, so a stale local copy of a branch that moved
+  # on (or was merged) on the server does not decide its status.
+  helper(:branch_report_row) do |name, refs, base, prs_by_head, prs_by_ticket, now, threshold, current|
+    local, remote = refs.values_at(:local, :remote)
+    tip = [local, remote].compact.max_by { |ref| ref[:epoch] }
+    ahead, behind = branch_ahead_behind(tip[:name], base)
+    prs = prs_by_head[name] || []
+    same_ticket_prs = prs.empty? ? (prs_by_ticket[branch_ticket_id(name)] || []) : []
+    merged = branch_merged?(tip[:name], base) || branch_pr_merged?(prs, tip[:sha])
+    idle_days = (now - tip[:epoch]) / 86_400
+    created = branch_created_date(tip[:name], base) ||
+              prs.filter_map { |pr| pr["createdAt"] }.min&.then { |time| Time.parse(time).strftime("%Y-%m-%d") }
+
+    {
+      name: name, where: local && remote ? "local+remote" : (local ? "local" : "remote"),
+      created: created, date: tip[:date], author: tip[:author], ahead: ahead, behind: behind,
+      merged: merged, idle_days: idle_days, current: name == current,
+      status: branch_status(prs.any? { |pr| pr["state"] == "OPEN" }, merged, idle_days, threshold),
+      prs: prs.empty? ? same_ticket_prs : prs, same_ticket: prs.empty? && !same_ticket_prs.empty?
+    }
+  end
+
+  # Pure: the Markdown table for +rows+, or "_none_".
+  helper(:branch_table_lines) do |rows, default_name = nil|
+    next ["_none_", ""] if rows.empty?
+
+    lines = [
+      "| | Branch | Where | Created | Last commit | Author | Ahead | Behind | Merged | Pull Request(s) |",
+      "|---|---|---|---|---|---|---:|---:|:---:|---|"
+    ]
+    rows.each do |r|
+      lines << format("| %s | `%s`%s | %s | %s | %s (%dd ago) | %s | %s | %s | %s | %s |",
+                      r[:current] ? "→" : "", branch_cell(r[:name]), r[:current] ? " *(current)*" : "",
+                      r[:where], r[:created] || "—", r[:date], r[:idle_days], branch_cell(r[:author]),
+                      r[:ahead].nil? ? "-" : r[:ahead], r[:behind].nil? ? "-" : r[:behind],
+                      r[:merged] ? "yes" : "no", branch_pr_cell(r[:prs], r[:same_ticket], default_name))
+    end
+    lines << ""
+  end
+
+  # Pure: the whole report as lines. +meta+ carries default_name, base,
+  # threshold, gh (was PR data available?), tickets (is ticket matching
+  # on?) and drift (the local default branch's [ahead, behind] against
+  # base, or nil).
+  helper(:branch_report_lines) do |rows, meta|
+    default_name, base, threshold = meta.values_at(:default_name, :base, :threshold)
+    buckets = { active: [], stale: [], merged: [] }
+    rows.each { |row| buckets[row[:status]] << row }
+    buckets.each_value { |bucket| bucket.sort_by! { |row| row[:idle_days] } }
+
+    notes = []
+    notes << "`gh` unavailable: merge state is git ancestry only, with no PR linkage" unless meta[:gh]
+    if meta[:drift] && meta[:drift] != [0, 0]
+      notes << "local `#{default_name}` is #{meta[:drift][0]} ahead of and #{meta[:drift][1]} behind `#{base}`"
+    end
+
+    lines = [
+      "# Branch Report — #{Date.today}",
+      "",
+      "**Default branch:** `#{default_name}` (comparing against `#{base}`#{" as of the last fetch" if base != default_name}) · " \
+      "**Staleness threshold:** #{threshold} day(s) · **#{rows.size} branch(es)** (excluding `#{default_name}`)",
+      "",
+    ]
+    lines.concat(notes.map { |note| "> #{note}" }, [""]) unless notes.empty?
+    lines.concat([
+      "**Legend**",
+      "",
+      "- **Where** — `local`, `remote` (on origin, or another remote when the name carries its prefix), or `local+remote`. " \
+      "With both, the newer tip is the one measured.",
+      "- **Created** — date of the branch's first commit not on `#{base}` (else the earliest PR's creation date; " \
+      "`—` when the branch is fully merged, so its start can no longer be read from history).",
+      "- **Merged** — the tip is an ancestor of `#{base}`#{meta[:gh] ? ", or a PR from this branch was `MERGED` and the branch has not moved since (squash and rebase merges leave the tip a non-ancestor)" : ""}.",
+      ("- **Pull Request(s)** — PRs opened from this branch#{meta[:tickets] ? "; *same ticket* marks PRs found by ticket id instead, for a branch that never had its own PR" : ""}." if meta[:gh]),
+      "- **Ahead/Behind** — commits on the branch not on `#{base}` / commits on `#{base}` not on the branch.",
+      "- **Status** — `Active`: an open PR, or a commit within #{threshold} day(s). `Stale`: unmerged, no open PR, idle for over #{threshold} day(s). `Merged`: safe to delete.",
+      "",
+      "## Summary",
+      "",
+      "| Category | Count |",
+      "|---|---:|",
+      "| Active (open PR or recent commits) | #{buckets[:active].size} |",
+      "| Stale (candidates for deletion) | #{buckets[:stale].size} |",
+      "| Merged (safe to delete) | #{buckets[:merged].size} |",
+      "",
+      "## Active branches",
+      "",
+    ].compact)
+    lines.concat(branch_table_lines(buckets[:active], default_name))
+    lines.concat(["## Stale branches (unmerged, idle over #{threshold} day(s))", "",
+                  "No open PR and no recent activity. Review for salvageable work, then delete.", ""])
+    lines.concat(branch_table_lines(buckets[:stale], default_name))
+    lines.concat(["## Merged branches (safe to delete)", ""])
+    lines.concat(branch_table_lines(buckets[:merged], default_name))
+    lines.concat([
+      "## Cleanup commands",
+      "",
+      "```bash",
+      "git fetch --prune                        # drop remote-tracking refs whose branch is gone from the remote",
+      "git branch -d <branch-name>              # delete a merged local branch (-D when it was squash-merged)",
+      "git push origin --delete <branch-name>   # delete a remote branch",
+      "```",
+    ])
+  end
+
+  desc "Status of every branch (local and remote copies in one row), as Markdown: PR-aware merge state, activity, ahead/behind, sorted into Active/Stale/Merged (days: staleness threshold, default #{DEFAULT_STALE_DAYS})"
   def branch_report(days = DEFAULT_STALE_DAYS)
     threshold = begin
       Integer(days)
@@ -91,69 +296,21 @@ class Tasks
 
     default_name = branch_default_name
     base = branch_resolvable_base(default_name)
-    now = Time.now.to_i
-
     current, ok = branch_capture("symbolic-ref", "--short", "HEAD")
     current = ok ? current.strip : nil
 
-    # A branch flagged "merged" here is only flagged "merged more than N days
-    # ago" using its own last-commit date as a stand-in for the merge date —
-    # finding the actual merge commit for every branch would mean walking
-    # main's full history per branch. Once a branch is merged its tip stops
-    # moving, so the two dates are usually close (exact for a fast-forward or
-    # squash merge, off by however long the PR waited for review otherwise).
-    merged_old = []
-    stale = []
+    all_prs, gh_available = branch_pull_requests
+    prs_by_head   = all_prs.group_by { |pr| pr["headRefName"] }
+    prs_by_ticket = all_prs.group_by { |pr| branch_ticket_id(pr["title"]) }.except(nil)
 
-    lines = [
-      "# Branch Report — #{Date.today}",
-      "",
-      "**Default branch:** `#{default_name}` (comparing against `#{base}`; staleness threshold: #{threshold} day(s))",
-      "",
-    ]
-
-    [["Local", "refs/heads"], ["Remote", "refs/remotes"]].each do |label, prefix|
-      rows = branch_rows(prefix).sort_by { |r| r[:epoch] }
-      lines << "## #{label} branches (#{rows.size})"
-      lines << ""
-
-      if rows.empty?
-        lines << "_none_"
-        lines << ""
-        next
-      end
-
-      lines << "| | Name | Last commit | Author | Ahead | Behind | Merged | Days idle |"
-      lines << "|---|---|---|---|---:|---:|:---:|---:|"
-
-      rows.each do |row|
-        idle_days = (now - row[:epoch]) / 86_400
-        ahead, behind = branch_ahead_behind(row[:name], base)
-        merged = branch_merged?(row[:name], base)
-        marker = row[:name] == current ? "→" : ""
-
-        lines << format("| %s | `%s` | %s | %s | %s | %s | %s | %d |",
-                         marker, branch_cell(row[:name]), row[:date], branch_cell(row[:author]),
-                         ahead.nil? ? "-" : ahead, behind.nil? ? "-" : behind,
-                         merged ? "yes" : "no", idle_days)
-
-        next if branch_default?(row[:name], default_name)
-
-        stale << row.merge(idle_days: idle_days) if idle_days > threshold
-        merged_old << row.merge(idle_days: idle_days) if merged && idle_days > threshold
-      end
-      lines << ""
+    logical = branch_logical(branch_rows("refs/heads"), branch_rows("refs/remotes"))
+    drift = base == default_name || !logical.dig(default_name, :local) ? nil : branch_ahead_behind(default_name, base)
+    now = Time.now.to_i
+    rows = logical.except(default_name).map do |name, refs|
+      branch_report_row(name, refs, base, prs_by_head, prs_by_ticket, now, threshold, current)
     end
 
-    lines << "## Merged more than #{threshold} day(s) ago (#{merged_old.size})"
-    lines << ""
-    lines.concat(merged_old.empty? ? ["_none_"] : merged_old.map { |r| "- `#{r[:name]}` — last commit #{r[:date]}, #{r[:idle_days]}d idle" })
-    lines << ""
-
-    lines << "## No activity for over #{threshold} day(s) (#{stale.size})"
-    lines << ""
-    lines.concat(stale.empty? ? ["_none_"] : stale.map { |r| "- `#{r[:name]}` — last commit #{r[:date]}, #{r[:idle_days]}d idle" })
-
-    puts lines.join("\n")
+    puts branch_report_lines(rows, default_name:, base:, threshold:, gh: gh_available,
+                                   tickets: !branch_ticket_pattern.nil?, drift:).join("\n")
   end
 end
