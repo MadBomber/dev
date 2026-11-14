@@ -30,6 +30,18 @@ import_up "dev/git.loki"
 import_up "dev/quality_rails.loki" if ENV["RAILS_ROOT"]   # Rails apps only
 ```
 
+To take every task file at once, import `dev/.loki` instead. It imports
+each `*.loki` file in this directory, including any added later:
+
+```ruby
+import_up "dev/.loki"
+```
+
+That loads all of them whether or not they fit the repo: a non-Rails repo
+gets the Rails gates too (they report SKIP in `quality`), and a repo that
+isn't a gem still gets `build`, `install` and `release`. Import files one
+by one, as above, to keep a repo's command list to what it uses.
+
 Because every `.loki` file simply reopens `class Tasks`, imported tasks merge
 into one command set, and a repo may override any task locally (e.g. a repo
 whose `push` also pushes tags).
@@ -66,6 +78,7 @@ whose `push` also pushes tags).
 
 | File | Provides |
 |------|----------|
+| `.loki` | Imports every `*.loki` file below, for `import_up "dev/.loki"` |
 | `gem_tasks.loki` | Gem lifecycle: `console`, `build`, `install`, `release` |
 | `quality.loki` | The `quality` gate and the `*_check` tasks it runs |
 | `quality_rails.loki` | Rails-only checks: Brakeman, RailsBestPractices, ActiveRecordDoctor |

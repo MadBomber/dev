@@ -3,6 +3,7 @@
 > Shared Asgard task libraries for Ruby projects. The repo holds no application code: just `.loki` task files for Asgard (a Thor-based task runner) and a strict RuboCop overlay.
 
 - Projects don't copy these tasks. They import them with `import_up "dev/<file>.loki"`, which searches upward from the project directory, so `dev/` can sit beside the project or beside any of its parent directories.
+- `import_up "dev/.loki"` imports every task file at once, including ones that don't fit the repo (Rails gates report SKIP in a non-Rails repo).
 - Every `.loki` file reopens `class Tasks`, so imported tasks merge into one command set and a repo may override any of them locally.
 - `quality` discovers and runs every task whose name ends in `_check`; check tasks return `:pass`, `:fail`, `:warn` or `:skip`, and only `:fail` blocks.
 - Requires asgard 0.6.0 or later (Ruby 4.0 or later). flay and reek must be installed in asgard's own Ruby.
@@ -14,6 +15,7 @@
 
 ## Task files
 
+- [.loki](https://github.com/MadBomber/dev/blob/main/.loki): imports every `*.loki` file in the repo
 - [gem_tasks.loki](https://github.com/MadBomber/dev/blob/main/gem_tasks.loki): gem lifecycle: `console`, `build`, `install`, `release`
 - [quality.loki](https://github.com/MadBomber/dev/blob/main/quality.loki): the `quality` gate and its checks: `test_check`, `rubocop_check`, `flog_check`, `flay_check`, `reek_check`, `typos_check`, `erb_lint_check`, `fasterer_check`, `scrap_check`, `bundler_audit_check`, `archspec_check`; plus `rubocop_fix`, `typos_fix`, `reek_baseline`, `test_verbose`
 - [quality_rails.loki](https://github.com/MadBomber/dev/blob/main/quality_rails.loki): Rails-only checks, imported when `RAILS_ROOT` is set: `brakeman_check`, `rails_best_practices_check`, `active_record_doctor_check`

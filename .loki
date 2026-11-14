@@ -1,0 +1,4 @@
+# dev/.loki
+# import all of the development loki task files
+
+import '*.loki'
