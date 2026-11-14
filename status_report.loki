@@ -300,7 +300,7 @@ class Tasks
   def status_date_guard = status_target_date
 
   desc "Collect today's activity from every configured source into notes/_status/<date>.md"
-  depends_on -> { [:status_date_guard,all_commands.keys.grep(/_collect\z/).sort.map(&:to_sym)] }
+  depends_on -> { [:status_date_guard, all_commands.keys.grep(/_collect\z/).sort.map(&:to_sym)] }
   def daily_summary
     date = status_target_date
     collect_tasks = self.class._deps.fetch(:daily_summary, []).flatten.map(&:to_s).grep(/_collect\z/)
