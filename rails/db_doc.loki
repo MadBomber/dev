@@ -1,8 +1,7 @@
-# linda-crnic/vbr/db_doc.loki
-#
 # tbls (https://github.com/k1low/tbls) support tasks: database schema docs
 # generated from the live dev database into notes/dbdoc (untracked, like the
-# rest of notes/). Imported from this repo's .loki.
+# rest of notes/). Import it with `import_up "dev/rails/*.loki"` or
+# `import_up "dev/rails/db_doc.loki"`.
 #
 # tbls runs on the host against the devcontainer's Postgres, which is
 # published on localhost:5432. The login shell exports PGGSSENCMODE, which

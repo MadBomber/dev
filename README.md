@@ -27,20 +27,31 @@ parents until it finds the named file — so no relative paths to maintain:
 import_up "dev/gem_tasks.loki"
 import_up "dev/quality.loki"
 import_up "dev/git.loki"
-import_up "dev/quality_rails.loki" if ENV["RAILS_ROOT"]   # Rails apps only
+import_up "dev/rails/*.loki" if ENV["RAILS_ROOT"]          # Rails apps only
 ```
 
-To take every task file at once, import `dev/.loki` instead. It imports
-each `*.loki` file in this directory, including any added later:
+To take every general task file at once, import `dev/.loki` instead. It
+imports each `*.loki` file in this directory, including any added later:
 
 ```ruby
 import_up "dev/.loki"
 ```
 
-That loads all of them whether or not they fit the repo: a non-Rails repo
-gets the Rails gates too (they report SKIP in `quality`), and a repo that
+That loads all of them whether or not they fit the repo: a repo that
 isn't a gem still gets `build`, `install` and `release`. Import files one
 by one, as above, to keep a repo's command list to what it uses.
+
+The task files in `rails/` are for Rails apps only. Neither `dev/.loki`
+nor a `dev/*.loki` glob reaches into that directory, so a Rails repo
+imports them itself:
+
+```ruby
+import_up "dev/rails/*.loki"
+```
+
+`quality_rails.loki` and `db_doc.loki` used to sit at the top level. A
+repo that imports either by its old path (`dev/quality_rails.loki`,
+`dev/db_doc.loki`) must switch to the `dev/rails/` path.
 
 Because every `.loki` file simply reopens `class Tasks`, imported tasks merge
 into one command set, and a repo may override any task locally (e.g. a repo
@@ -78,16 +89,16 @@ whose `push` also pushes tags).
 
 | File | Provides |
 |------|----------|
-| `.loki` | Imports every `*.loki` file below, for `import_up "dev/.loki"` |
+| `.loki` | Imports every top-level `*.loki` file below (not `rails/`), for `import_up "dev/.loki"` |
 | `gem_tasks.loki` | Gem lifecycle: `console`, `build`, `install`, `release` |
 | `quality.loki` | The `quality` gate and the `*_check` tasks it runs |
-| `quality_rails.loki` | Rails-only checks: Brakeman, RailsBestPractices, ActiveRecordDoctor |
+| `rails/quality_rails.loki` | Rails-only checks: Brakeman, RailsBestPractices, ActiveRecordDoctor |
 | `git.loki` | Per-repo git basics: `push`, `pull` (ff-only), `fetch` |
 | `doc_tasks.loki` | Documentation site tasks, for a repo with `mkdocs.yml` or `bridgetown.config.yml`: `doc install`, `doc build`, `doc serve`, `doc open` |
 | `status_report.loki` | End-of-week client status reporting: `daily_summary`, `weekly_report` |
 | `iterm_tasks.loki` | Terminal fixes: `half_duplex_screen_fix`, `clear_scroll_back_buffer` |
 | `branch_report.loki` | `branch_report [DAYS]`: read-only table of every local and remote branch (ahead/behind and merged measured against `origin/<default>` as of the last fetch, else the local default), then the ones idle (or merged and idle) over DAYS, default 30 |
-| `db_doc.loki` | [tbls](https://github.com/k1LoW/tbls) schema docs into `notes/dbdoc` (needs Postgres up on localhost:5432; `DB_DOC_DSN` overrides the default vbr_development DSN): `db_doc`, `db_doc_diff`, `db_doc_mermaid`, `db_doc_open`, `db_doc_clean` |
+| `rails/db_doc.loki` | [tbls](https://github.com/k1LoW/tbls) schema docs into `notes/dbdoc` (needs Postgres up on localhost:5432; `DB_DOC_DSN` overrides the default vbr_development DSN): `db_doc`, `db_doc_diff`, `db_doc_mermaid`, `db_doc_open`, `db_doc_clean` |
 | `fake_aws.loki` | AWS's local API emulator in Docker (its Dockerfile and smoke test are in `fake_aws/`): `asgard fake_aws build`, `start`, `stop`, `restart`, `status`, `logs`, `version`, `exports`, `smoke`, `remove` |
 | `rubocop-strict.yml` | Cops kept enabled with no exclusions over `.rubocop_todo.yml` (when inherited after it; see below) |
 
@@ -110,7 +121,7 @@ in `lib/<gem_name>/version.rb` (dashes become slashes), then in the first
 ### quality.loki
 
 The heart of the shared layer. `quality` discovers every task whose name ends
-in `_check` at run time — from this file, from `quality_rails.loki`, or from a
+in `_check` at run time — from this file, from `rails/quality_rails.loki`, or from a
 repo's own `.loki` — and runs them all in parallel, printing a colorized
 PASS/FAIL/WARN/SKIP summary. Adding a new gate anywhere is just defining
 another `*_check` task; nothing needs to be redeclared.
@@ -129,7 +140,7 @@ counts grandfathered in `.quality/reek_baseline.txt`. Its companion task,
 `asgard reek_baseline` when a regression is intentional (or to ratchet the
 counts down after a cleanup).
 
-### quality_rails.loki
+### rails/quality_rails.loki
 
 Rails-specific `*_check` gates, gated on `RAILS_ROOT` (set in a Rails repo's
 `.envrc`) rather than `defined?(Rails)`, since Asgard runs outside the app's

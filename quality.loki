@@ -6,7 +6,7 @@
 # Mirrors asgard's own quality.loki (the golden pattern): every `quality`
 # gate is a `*_check` task; `quality` discovers them dynamically at runtime
 # rather than a fixed list, so a `*_check` task from elsewhere (e.g.
-# quality_rails.loki's brakeman_check, once a Rails project imports that
+# rails/quality_rails.loki's brakeman_check, once a Rails project imports that
 # file (see its header), or a component's own archspec_check) is picked up
 # too, with no need to redeclare or extend anything.
 
@@ -313,7 +313,7 @@ class Tasks
   end
 
   # Curated display labels for the *_check tasks defined in this file. A
-  # *_check task from elsewhere (e.g. quality_rails.loki's brakeman_check,
+  # *_check task from elsewhere (e.g. rails/quality_rails.loki's brakeman_check,
   # when a Rails project imports that file) isn't listed here — it just
   # falls back to a titleized version of its own name in quality_gate_label.
   QUALITY_GATE_LABELS = {

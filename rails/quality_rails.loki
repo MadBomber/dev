@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # MadBomber-level Rails-specific quality gate tasks. Universal across all
 # projects. Import from a project-level loki (e.g.
-# `import_up "dev/quality_rails.loki" if ENV["RAILS_ROOT"]`), mirroring
+# `import_up "dev/rails/*.loki" if ENV["RAILS_ROOT"]`), mirroring
 # asgard's own quality_rails.loki. Gated on RAILS_ROOT rather than
 # `defined?(Rails)`: asgard runs as a separate process outside the app it's
 # checking, so the app's Rails constant is never loaded into asgard's own
@@ -18,12 +18,12 @@
 # `require: rubocop-rails` in its .rubocop.yml — the existing rubocop_check
 # (quality.loki) picks up the added Rails cops automatically.
 
-# bundled_gem? lives in quality.loki. Importing it here lets a project load
+# bundled_gem? lives in ../quality.loki. Importing it here lets a project load
 # the Rails gates on their own. The guard, not just import's own
 # already-loaded check, keeps it to one load when dev/ is reached through
 # a symlink: import resolves this file's relative path to the real one, a
 # different string from the symlinked path import_up recorded.
-import "quality.loki" unless Tasks.method_defined?(:bundled_gem?)
+import "../quality.loki" unless Tasks.method_defined?(:bundled_gem?)
 
 class Tasks
   desc "Check for Rails security vulnerabilities with Brakeman"
