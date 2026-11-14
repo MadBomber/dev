@@ -1,4 +1,8 @@
-# Cops that must always fire, regardless of .rubocop_todo.yml or inline directives.
+# Cops that stay enabled, with no file exclusions, over .rubocop_todo.yml.
+# Only when inherited AFTER .rubocop_todo.yml (later inherit_from entries win).
+# `Exclude: []` clears nothing under `inherit_mode: merge: [Exclude]`.
+# Inline `# rubocop:disable` comments still win unless RuboCop runs with
+# --ignore-disable-comments.
 Lint/Debugger:
   Enabled: true
   Exclude: []

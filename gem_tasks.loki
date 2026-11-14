@@ -13,9 +13,29 @@ class Tasks
                    File.basename(Dir.pwd).freeze
                  end
 
+  # The version `gem build` will use: the gemspec's own, so a computed VERSION
+  # (e.g. `[0, 1, 0].join(".")`) still names the file right. Falls back to a
+  # string literal in lib/<gem_name with - as />/version.rb, then in the first
+  # version.rb that defines VERSION, then "?.?.?".
   helper(:gem_version) do
-    file = Dir.glob("lib/**/version.rb").first
-    file ? File.read(file)[/VERSION\s*=\s*['"]([^'"]+)['"]/, 1] : "?.?.?" rescue "?.?.?"
+    gemspec_version(Dir.glob("*.gemspec").first) || version_rb_literal || "?.?.?"
+  end
+
+  # nil when there is no gemspec or it doesn't load (RubyGems warns why).
+  helper(:gemspec_version) do |gemspec|
+    version = gemspec && Gem::Specification.load(gemspec)&.version&.to_s
+    version unless version.to_s.empty?
+  rescue StandardError
+    nil
+  end
+
+  helper(:version_rb_literal) do
+    pattern = /VERSION\s*=\s*['"]([^'"]+)['"]/
+    preferred = "lib/#{@@gem_name.tr('-', '/')}/version.rb"
+    candidates = [preferred, *Dir.glob("lib/**/version.rb")].uniq.select { File.file?(it) }
+    candidates.lazy.map { File.read(it)[pattern, 1] }.find { it && !it.empty? }
+  rescue StandardError
+    nil
   end
 
   desc "Open IRB console with gem loaded"
@@ -23,6 +43,10 @@ class Tasks
     if File.exist?("bin/console")
       sh "bin/console"
     else
+      # Since Ruby 4.0 irb is a bundled gem, so Bundler won't run it unless it's in the bundle.
+      if File.exist?("Gemfile.lock") && !File.read("Gemfile.lock").match?(/^\s+irb \(/)
+        abort "irb is not in the bundle: add `gem \"irb\"` to the Gemfile's development group, or add a bin/console."
+      end
       sh "bundle exec irb -Ilib -r #{@@gem_name.tr('-', '/')}"
     end
   end
@@ -31,9 +55,11 @@ class Tasks
   def build
     gemspec = Dir.glob("*.gemspec").first
     abort "No gemspec found in #{Dir.pwd}." unless gemspec
+    version = gem_version
+    abort "Cannot determine #{@@gem_name}'s version from #{gemspec} or lib/**/version.rb." if version == "?.?.?"
 
     FileUtils.mkdir_p("pkg")
-    sh "gem build #{gemspec} --output pkg/#{@@gem_name}-#{gem_version}.gem"
+    sh "gem build #{gemspec} --output pkg/#{@@gem_name}-#{version}.gem"
   end
 
   desc "Build and install gem locally"
@@ -47,12 +73,12 @@ class Tasks
   depends_on [:quality, :build]
   def release
     version = gem_version
-    abort "Could not determine #{@@gem_name}'s version — refusing to release." if version.to_s.empty? || version == "?.?.?"
+    abort "Cannot determine #{@@gem_name}'s version from its gemspec or lib/**/version.rb — refusing to release." if version.to_s.empty? || version == "?.?.?"
 
     unless options[:yes]
       print "Release #{@@gem_name} v#{version} to RubyGems? [y/N] "
       $stdout.flush
-      return puts "Aborted." unless $stdin.gets.strip.downcase == "y"
+      return puts "Aborted." unless $stdin.gets.to_s.strip.downcase == "y"
     end
 
     # Untracked files never reach the gem (git ls-files-based gemspecs), so

@@ -1,5 +1,3 @@
-# linda-crnic/vbr/branch_report.loki
-#
 # Status of every local and remote branch: last activity, ahead/behind the
 # default branch, and merge state — so stale and already-merged branches are
 # easy to spot before cleanup. Read-only; never deletes, pushes, or fetches.
@@ -14,7 +12,7 @@ class Tasks
   DEFAULT_STALE_DAYS = 30
 
   helper(:branch_capture) do |*args|
-    out, status = Open3.capture2("git", *args)
+    out, status = Open3.capture2("git", *args, err: File::NULL)
     [out, status.success?]
   end
 
@@ -28,27 +26,43 @@ class Tasks
     %w[main master].find { |name| locals.lines.map(&:strip).include?(name) } || "main"
   end
 
-  # rev-list/merge-base need a ref that actually resolves: prefer the local
-  # branch of that name (what's usually checked out) and fall back to the
-  # remote-tracking ref when there's no local copy of the default branch.
+  # rev-list/merge-base need a ref that actually resolves: prefer origin's
+  # copy, so a branch merged on the server reads as merged once fetched
+  # (no pull needed; this task never fetches), and the local default row
+  # shows how far it has drifted.
+  # Falls back to the local branch when origin has no such ref.
   helper(:branch_resolvable_base) do |name|
-    locals, = branch_capture("for-each-ref", "refs/heads", "--format=%(refname:short)")
-    locals.lines.map(&:strip).include?(name) ? name : "origin/#{name}"
+    _, ok = branch_capture("rev-parse", "--verify", "--quiet", "refs/remotes/origin/#{name}")
+    ok ? "origin/#{name}" : name
   end
 
   # One row per ref under prefix: name, last-commit epoch/date, author.
+  # Fields are NUL-separated: branch and author names may contain "|", but
+  # neither can contain NUL.
   # Drops symbolic refs (origin/HEAD) — not a real branch. Its short name
   # abbreviates to the bare remote name ("origin", not "origin/HEAD"), so
   # this filters on %(symref) rather than a "/HEAD" suffix match.
   helper(:branch_rows) do |ref_prefix|
-    fmt = "%(symref)|%(refname:short)|%(committerdate:unix)|%(committerdate:short)|%(authorname)"
+    fmt = "%(symref)%00%(refname:short)%00%(committerdate:unix)%00%(committerdate:short)%00%(authorname)"
     out, = branch_capture("for-each-ref", ref_prefix, "--format=#{fmt}")
     out.each_line.filter_map do |line|
-      symref, name, epoch, date, author = line.chomp.split("|", 5)
+      symref, name, epoch, date, author = line.chomp.split("\0", 5)
       next unless symref.to_s.empty?
 
       { name: name, epoch: epoch.to_i, date: date, author: author.to_s }
     end
+  end
+
+  # Escapes "|" so a branch or author name containing one stays in its
+  # Markdown table cell instead of splitting the row.
+  helper(:branch_cell) do |text|
+    text.to_s.gsub("|", "\\|")
+  end
+
+  # The default branch itself, local or remote ("main", "origin/main"), is
+  # never listed as merged or idle.
+  helper(:branch_default?) do |name, default_name|
+    [default_name, "origin/#{default_name}"].include?(name)
   end
 
   helper(:branch_ahead_behind) do |name, base|
@@ -71,6 +85,9 @@ class Tasks
     rescue ArgumentError, TypeError
       abort "branch_report: days must be an integer, got #{days.inspect}"
     end
+
+    _, in_repo = branch_capture("rev-parse", "--git-dir")
+    abort "branch_report: not a git repository" unless in_repo
 
     default_name = branch_default_name
     base = branch_resolvable_base(default_name)
@@ -116,11 +133,11 @@ class Tasks
         marker = row[:name] == current ? "→" : ""
 
         lines << format("| %s | `%s` | %s | %s | %s | %s | %s | %d |",
-                         marker, row[:name], row[:date], row[:author],
+                         marker, branch_cell(row[:name]), row[:date], branch_cell(row[:author]),
                          ahead.nil? ? "-" : ahead, behind.nil? ? "-" : behind,
                          merged ? "yes" : "no", idle_days)
 
-        next if row[:name] == default_name
+        next if branch_default?(row[:name], default_name)
 
         stale << row.merge(idle_days: idle_days) if idle_days > threshold
         merged_old << row.merge(idle_days: idle_days) if merged && idle_days > threshold

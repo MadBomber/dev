@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # MadBomber-level Rails-specific quality gate tasks. Universal across all
 # projects. Import from a project-level loki (e.g.
-# `import_up "dev/quality_rails.loki" if ENV["RAILS_ROOT"]`), mirroring
+# `import_up "dev/rails/*.loki" if ENV["RAILS_ROOT"]`), mirroring
 # asgard's own quality_rails.loki. Gated on RAILS_ROOT rather than
 # `defined?(Rails)`: asgard runs as a separate process outside the app it's
 # checking, so the app's Rails constant is never loaded into asgard's own
@@ -18,9 +18,18 @@
 # `require: rubocop-rails` in its .rubocop.yml — the existing rubocop_check
 # (quality.loki) picks up the added Rails cops automatically.
 
+# bundled_gem? lives in ../quality.loki. Importing it here lets a project load
+# the Rails gates on their own. The guard, not just import's own
+# already-loaded check, keeps it to one load when dev/ is reached through
+# a symlink: import resolves this file's relative path to the real one, a
+# different string from the symlinked path import_up recorded.
+import "../quality.loki" unless Tasks.method_defined?(:bundled_gem?)
+
 class Tasks
   desc "Check for Rails security vulnerabilities with Brakeman"
   def brakeman_check
+    return skip_brakeman unless bundled_gem?("brakeman")
+
     output = `bundle exec brakeman -q 2>&1`
     result = $?.success? ? :pass : :fail
     File.write("brakeman_output.txt", output)
@@ -31,6 +40,8 @@ class Tasks
 
   desc "Check for Rails anti-patterns with RailsBestPractices"
   def rails_best_practices_check
+    return skip_rails_best_practices unless bundled_gem?("rails_best_practices")
+
     output = `bundle exec rails_best_practices --silent --without-color . 2>&1`
     result = $?.success? ? :pass : :fail
     File.write("rails_best_practices_output.txt", output)
@@ -41,6 +52,8 @@ class Tasks
 
   desc "Check for database schema issues with ActiveRecordDoctor"
   def active_record_doctor_check
+    return skip_active_record_doctor unless bundled_gem?("active_record_doctor")
+
     output = `bundle exec rake active_record_doctor 2>&1`
     result = $?.success? ? :pass : :fail
     File.write("active_record_doctor_output.txt", output)
@@ -48,5 +61,25 @@ class Tasks
     summary = result == :pass ? "no issues found" : "#{issue_count} issue line(s) found"
     puts "ActiveRecordDoctor: #{summary} (see active_record_doctor_output.txt)"
     result
+  end
+
+  no_commands do
+    def skip_brakeman
+      puts "Brakeman: SKIPPED — brakeman is not in this repo's bundle. " \
+        "Add it to the Gemfile's development group to enable this gate."
+      :skip
+    end
+
+    def skip_rails_best_practices
+      puts "RailsBestPractices: SKIPPED — rails_best_practices is not in this repo's bundle. " \
+        "Add it to the Gemfile's development group to enable this gate."
+      :skip
+    end
+
+    def skip_active_record_doctor
+      puts "ActiveRecordDoctor: SKIPPED — active_record_doctor is not in this repo's bundle. " \
+        "Add it to the Gemfile's development group to enable this gate."
+      :skip
+    end
   end
 end

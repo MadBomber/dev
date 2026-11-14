@@ -1,14 +1,14 @@
 # frozen_string_literal: true
 # MadBomber-level quality-gate tasks. Universal across all projects.
-# Import from a project-level loki (e.g. `import "../dev/quality.loki"`), which
+# Import from a project-level loki (e.g. `import_up "dev/quality.loki"`), which
 # component .loki files then reach via `import_up "repo_dev.loki"`.
 #
 # Mirrors asgard's own quality.loki (the golden pattern): every `quality`
 # gate is a `*_check` task; `quality` discovers them dynamically at runtime
 # rather than a fixed list, so a `*_check` task from elsewhere (e.g.
-# quality_rails.loki's brakeman_check, loaded automatically once Rails is
-# defined, or a component's own archspec_check) is picked up too, with no
-# need to redeclare or extend anything.
+# rails/quality_rails.loki's brakeman_check, once a Rails project imports that
+# file (see its header), or a component's own archspec_check) is picked up
+# too, with no need to redeclare or extend anything.
 
 class Tasks
   # Directories the structural gates (flog / flay / reek / fasterer) scan.
@@ -40,7 +40,9 @@ class Tasks
   def quality
     check_tasks = self.class._deps.fetch(:quality, []).flatten.map(&:to_s)
 
-    results = check_tasks.to_h { |name| [quality_gate_label(name), dep_result(name)] }
+    results = check_tasks.to_h do |name|
+      [quality_gate_label(name), quality_check_status(name, dep_result(name))]
+    end
 
     print_quality_summary(results)
   end
@@ -70,7 +72,14 @@ class Tasks
     method_warn = 20.0
     method_fail = 50.0
 
-    flog   = bundled_gem?("flog") ? "bundle exec flog" : "flog"
+    flog =
+      if bundled_gem?("flog")
+        "bundle exec flog"
+      elsif command_available?("flog")
+        "flog"
+      else
+        return skip_flog
+      end
     output = `#{flog} --all --methods-only --quiet #{@@quality_dirs.join(' ')} 2>&1`
     unless $?.success?
       File.write("flog_output.txt", output)
@@ -88,9 +97,9 @@ class Tasks
       score, method_name = m[1].to_f, m[2]
       next unless method_name.include?("#") || method_name.include?("::")
       next if method_name.end_with?("#none")
-      if score > method_fail
+      if score >= method_fail
         failures << "#{"%.1f" % score}: #{method_name}"
-      elsif score > method_warn
+      elsif score >= method_warn
         warnings << "#{"%.1f" % score}: #{method_name}"
       end
     end
@@ -110,7 +119,8 @@ class Tasks
 
   desc "Check for structural code duplication with Flay (mass >= 150)"
   def flay_check
-    require "flay"
+    return skip_flay unless gem_loadable?("flay")
+    require "flay" # no-op once loaded; keeps Flay below independent of the guard
 
     mass_threshold = 150
 
@@ -131,52 +141,17 @@ class Tasks
     result
   end
 
+  # Grandfathered Reek smell counts: reek_baseline writes it, reek_check reads it.
+  REEK_BASELINE_PATH = File.join(".quality", "reek_baseline.txt").freeze
+
   desc "Check code smells with Reek (fails only on new/worsened files vs .quality/reek_baseline.txt)"
   def reek_check
-    require "reek"
-    require "reek/configuration/app_configuration"
-    require "pathname"
+    return skip_reek unless gem_loadable?("reek")
 
-    # Resolve .reek.yml by walking up from cwd: a component-level config wins,
-    # otherwise the shared workspace-level one is used.
-    config_file = nil
-    dir = Pathname.new(Dir.pwd).expand_path
-    loop do
-      candidate = dir.join(".reek.yml")
-      if candidate.exist?
-        config_file = candidate.to_s
-        break
-      end
-      break if dir.root?
+    config = reek_configuration
+    current = reek_smell_counts(reek_source_files(config), config)
 
-      dir = dir.parent
-    end
-    # Reek's Examiner defaults its configuration keyword to
-    # AppConfiguration.default — passing an explicit nil overrides that and
-    # crashes (undefined method 'directive_for' for nil), so build the
-    # default ourselves when no .reek.yml was found.
-    config =
-      if config_file
-        Reek::Configuration::AppConfiguration.from_path(Pathname.new(config_file))
-      else
-        Reek::Configuration::AppConfiguration.default
-      end
-
-    # Smell count per file (only files with at least one smell).
-    current = quality_source_files.each_with_object({}) do |file, acc|
-      count = Reek::Examiner.new(File.read(file), configuration: config).smells.size
-      acc[file] = count if count.positive?
-    end
-
-    # Grandfathered smell counts from .quality/reek_baseline.txt ("count\tfile").
-    baseline_path = File.join(".quality", "reek_baseline.txt")
-    baseline = {}
-    if File.exist?(baseline_path)
-      File.readlines(baseline_path).each do |line|
-        count, file = line.strip.split("\t", 2)
-        baseline[file] = count.to_i if file && !file.empty?
-      end
-    end
+    baseline = File.exist?(REEK_BASELINE_PATH) ? parse_reek_baseline(File.read(REEK_BASELINE_PATH)) : {}
 
     new_files = current.reject { |file, _| baseline.key?(file) }
     worsened  = current.select { |file, count| baseline.key?(file) && count > baseline[file] }
@@ -205,6 +180,18 @@ class Tasks
       end
     puts "Reek: #{summary} (see reek_output.txt)"
     result
+  end
+
+  desc "Regenerate .quality/reek_baseline.txt (grandfathers current Reek smell counts per file)"
+  def reek_baseline
+    abort "Reek: reek can not be loaded by asgard (not installed, or outside the active bundle). Install it with `gem install reek`." unless gem_loadable?("reek")
+    require "fileutils"
+
+    config = reek_configuration
+    counts = reek_smell_counts(reek_source_files(config), config)
+    FileUtils.mkdir_p(File.dirname(REEK_BASELINE_PATH))
+    File.write(REEK_BASELINE_PATH, reek_baseline_text(counts))
+    puts "Reek: baselined #{counts.values.sum} warning(s) across #{counts.size} file(s) in #{REEK_BASELINE_PATH}"
   end
 
   desc "Check spelling with typos"
@@ -247,6 +234,8 @@ class Tasks
 
   desc "Check for performance suggestions with Fasterer"
   def fasterer_check
+    return skip_fasterer unless bundled_gem?("fasterer")
+
     output = `bundle exec fasterer #{@@quality_dirs.join(' ')} 2>&1`.gsub(/\e\[\d+m/, "")
     result = $?.success? ? :pass : :warn
     File.write("fasterer_output.txt", output)
@@ -290,6 +279,8 @@ class Tasks
     command =
       if File.exist?("bin/bundler-audit")
         "bin/bundler-audit"
+      elsif !File.exist?(bundle_lockfile)
+        return skip_bundler_audit_lockfile
       elsif bundled_gem?("bundler-audit")
         # --gemfile-lock here too: without it bundle-audit defaults to
         # ./Gemfile.lock even when the bundle is running from Gemfile.local,
@@ -322,8 +313,8 @@ class Tasks
   end
 
   # Curated display labels for the *_check tasks defined in this file. A
-  # *_check task from elsewhere (e.g. quality_rails.loki's brakeman_check,
-  # loaded automatically once Rails is defined) isn't listed here — it just
+  # *_check task from elsewhere (e.g. rails/quality_rails.loki's brakeman_check,
+  # when a Rails project imports that file) isn't listed here — it just
   # falls back to a titleized version of its own name in quality_gate_label.
   QUALITY_GATE_LABELS = {
     "test_check"     => "Tests + Coverage",
@@ -342,6 +333,64 @@ class Tasks
       @@quality_dirs.flat_map { |dir| Dir.glob("#{dir}/**/*.rb") }
     end
 
+    # Reek configuration from the nearest .reek.yml at or above +start_dir+:
+    # a component-level config wins, otherwise the shared workspace-level one.
+    # Reek's Examiner defaults its configuration keyword to
+    # AppConfiguration.default — passing an explicit nil overrides that and
+    # crashes (undefined method 'directive_for' for nil), so build the
+    # default ourselves when no .reek.yml was found.
+    def reek_configuration(start_dir = Dir.pwd)
+      require "pathname"
+      require "reek"
+      require "reek/configuration/app_configuration"
+
+      config_file = Pathname.new(start_dir).expand_path.ascend.lazy
+        .map { |dir| dir.join(".reek.yml") }.find(&:exist?)
+      if config_file
+        Reek::Configuration::AppConfiguration.from_path(config_file)
+      else
+        Reek::Configuration::AppConfiguration.default
+      end
+    end
+
+    # Ruby files under +dirs+ that reek itself would examine: hidden
+    # directories and .reek.yml's exclude_paths are skipped. Directories
+    # that don't exist are dropped first, as the plain glob did, so Reek
+    # doesn't print "Error: No such file" for a component without app/.
+    def reek_source_files(config = reek_configuration, dirs: @@quality_dirs)
+      require "reek"
+      require "reek/cli/options"
+      require "reek/source/source_locator"
+
+      Reek::Source::SourceLocator.new(dirs.select { File.exist?(it) }, configuration: config).sources
+    end
+
+    # { file => smell count } for each of +files+ with at least one smell.
+    # Each file goes to Reek as a Pathname, not its contents, so Reek knows
+    # its path and applies .reek.yml's per-directory (directories:) settings.
+    def reek_smell_counts(files, config = reek_configuration)
+      require "pathname"
+      require "reek"
+
+      files.each_with_object({}) do |file, acc|
+        count = Reek::Examiner.new(Pathname(file), configuration: config).smells.size
+        acc[file.to_s] = count if count.positive?
+      end
+    end
+
+    # REEK_BASELINE_PATH body: one "count\tfile" line per file, sorted by file.
+    def reek_baseline_text(counts)
+      counts.sort.map { |file, count| "#{count}\t#{file}\n" }.join
+    end
+
+    # { file => count } from a REEK_BASELINE_PATH body; inverse of reek_baseline_text.
+    def parse_reek_baseline(text)
+      text.each_line.each_with_object({}) do |line, acc|
+        count, file = line.strip.split("\t", 2)
+        acc[file] = count.to_i if file && !file.empty?
+      end
+    end
+
     # Lockfile for the active Gemfile (BUNDLE_GEMFILE-aware, e.g. the
     # Gemfile.local convention used across these repos).
     def bundle_lockfile
@@ -352,6 +401,19 @@ class Tasks
     def bundled_gem?(name)
       File.exist?(bundle_lockfile) &&
         File.read(bundle_lockfile).match?(/^ {4}#{Regexp.escape(name)} \(/)
+    end
+
+    # true when +lib+ can be required into asgard's own Ruby (flay and
+    # reek run in-process, so the gem must be installed there). Only the
+    # gem itself being absent counts: a LoadError from inside an installed
+    # gem, or a Gem::ConflictError, is re-raised so the gate fails loudly.
+    def gem_loadable?(lib, loader: method(:require))
+      loader.call(lib)
+      true
+    rescue LoadError => e
+      raise if e.is_a?(Gem::LoadError) || e.path != lib
+
+      false
     end
 
     # true if +name+ resolves to an executable file somewhere on PATH.
@@ -389,6 +451,26 @@ class Tasks
       :skip
     end
 
+    def skip_bundler_audit_lockfile
+      puts "Bundler Audit: SKIPPED — no #{bundle_lockfile} found."
+      :skip
+    end
+
+    def skip_flog
+      puts "Flog: SKIPPED — flog not found in the bundle or on PATH. Install it with `gem install flog`."
+      :skip
+    end
+
+    def skip_flay
+      puts "Flay: SKIPPED — flay can not be loaded by asgard (not installed for asgard's Ruby, or not in the bundle under `bundle exec`). Install it with `gem install flay`."
+      :skip
+    end
+
+    def skip_reek
+      puts "Reek: SKIPPED — reek can not be loaded by asgard (not installed for asgard's Ruby, or not in the bundle under `bundle exec`). Install it with `gem install reek`."
+      :skip
+    end
+
     # Minitest files under test/, in either naming convention. Given a
     # directory, scrap4rb only globs *_test.rb, so a test_*.rb suite would
     # silently report 0 files — pass the files explicitly instead.
@@ -421,9 +503,18 @@ class Tasks
     end
 
     def skip_archspec
-      reason = command_available?("archspec") ? "no Archspec.rb found" : "`archspec` command not found"
-      puts "ArchSpec: SKIPPED — #{reason}. Install it with `gem install archspec` " \
-        "and run `archspec init` to generate one."
+      if command_available?("archspec")
+        puts "ArchSpec: SKIPPED — no Archspec.rb found. Run `archspec init` to generate one."
+      else
+        puts "ArchSpec: SKIPPED — `archspec` command not found. Install it with `gem install archspec` " \
+          "and run `archspec init` to generate an Archspec.rb."
+      end
+      :skip
+    end
+
+    def skip_fasterer
+      puts "Fasterer: SKIPPED — fasterer is not in this repo's bundle. " \
+        "Add it to the Gemfile's development group to enable this gate."
       :skip
     end
 
@@ -436,6 +527,16 @@ class Tasks
       warn: ["WARN", 33], # yellow
       skip: ["SKIP", 36], # cyan
     }.freeze
+
+    # A *_check task that returns anything but a STATUS_BADGES key counts as
+    # :fail (SKIP or WARN would let a broken gate pass silently), naming the
+    # task and its value so the summary still completes.
+    def quality_check_status(check_name, status)
+      return status if STATUS_BADGES.key?(status)
+
+      puts "#{check_name}: returned #{status.inspect}, not :pass/:fail/:warn/:skip — counting it as FAIL."
+      :fail
+    end
 
     # Colorized status badges plus a pass/fail/warn/skip tally; aborts only
     # if any gate failed — skip and warn are informational, not blocking.
