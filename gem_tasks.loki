@@ -47,6 +47,7 @@ class Tasks
   depends_on [:quality, :build]
   def release
     version = gem_version
+    abort "Could not determine #{@@gem_name}'s version — refusing to release." if version.to_s.empty? || version == "?.?.?"
 
     unless options[:yes]
       print "Release #{@@gem_name} v#{version} to RubyGems? [y/N] "
