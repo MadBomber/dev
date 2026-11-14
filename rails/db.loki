@@ -1,0 +1,447 @@
+# frozen_string_literal: true
+# dev/rails/db.loki — the LOCAL development database of a Rails app on
+# PostgreSQL. Import it with `import_up "dev/rails/*.loki"`.
+#
+#   asgard db status         — server liveness, the app's database sizes and
+#                              connections, latest migration
+#   asgard db tables         — largest tables in the database
+#   asgard db psql           — psql into the database
+#   asgard db backup         — pg_dump -Fc snapshot into tmp/db-dumps/ (alias: dump)
+#   asgard db backups        — list this database's snapshots, newest first
+#   asgard db dumps [DB]     — list every dump in tmp/db-dumps/ (or one database's);
+#                              --keep N deletes all but each database's newest N
+#   asgard db restore [DUMP] — restore a snapshot (default: the newest): backs the
+#                              database up first (--no-backup), drops and recreates
+#                              it (ending bin/dev's connections), asks you to type
+#                              its name (-y skips); --jobs N, --dry-run
+#   asgard db diff A B       — how the schema in dump B differs from dump A: objects
+#                              added, removed and changed, with the changed lines
+#                              (compared by name, so order does not matter); --sql
+#                              prints the unified diff of the whole schema SQL.
+#                              Any two pg_dump custom-format files. Reads files only.
+#   asgard db start          — pg_ctl start (needs $PGDATA)
+#   asgard db stop           — pg_ctl stop
+#
+# Configuration, all from the environment:
+#   DB_NAME          the database (default: <app directory>_development, Rails's
+#                    own default name, the app directory being RR or the
+#                    current directory)
+#   DB_HOST, DB_PORT the server (default localhost:5432)
+#   DB_USER          the role (default: PGUSER, else your login name)
+#   DB_DUMP_DIR      where dumps go (default: tmp/db-dumps in the app directory)
+#   DB_TUNNEL_PORTS  comma-separated local ports that forward to a REMOTE
+#                    database (an SSH or SSM tunnel); restore refuses them
+#
+# Dumps are DATABASE-YYYYMMDD-HHMMSS[-schema].dump, mode 600. Keep the dump
+# directory out of git: a dump is a full copy of the data.
+#
+# The helpers in the first Tasks block (local_backup, local_restore and the
+# guards) are top-level so a project's own tasks can reuse them, e.g. to
+# load a dump of a staging database into the local server: pass
+# local_restore a source other than "LOCAL" and it also relabels the
+# restored database as a development one.
+
+require "fileutils"
+require "open3"
+require "tempfile"
+
+class Tasks
+  LOCAL_DB_HOST   = ENV.fetch("DB_HOST", "localhost")
+  LOCAL_DB_PORT   = ENV.fetch("DB_PORT", "5432")
+  LOCAL_DB_USER   = ENV.fetch("DB_USER") { ENV.fetch("PGUSER") { ENV.fetch("USER", "postgres") } }
+  # Local ports known to forward to a remote database.
+  TUNNEL_PORTS    = ENV.fetch("DB_TUNNEL_PORTS", "").split(",").map(&:strip).reject(&:empty?).freeze
+  LOCAL_HOSTS     = %w[localhost 127.0.0.1 ::1].freeze
+  LOCAL_SERVERS   = %w[socket 127.0.0.1 ::1].freeze
+  SYSTEM_DBS      = %w[postgres template0 template1].freeze
+  RESTORE_TOOLS   = %w[pg_restore pg_dump psql dropdb createdb pg_isready].freeze
+  PG_INSTALL_HINT = "install the PostgreSQL client tools (e.g. brew install postgresql)"
+
+  # The app's root: RR when set, else the current directory.
+  helper(:db_app_root) { ENV.fetch("RR", Dir.pwd) }
+
+  # Where dumps are written and looked for.
+  helper(:dump_dir) { ENV.fetch("DB_DUMP_DIR") { File.join(db_app_root, "tmp", "db-dumps") } }
+
+  # Pure: Rails's default development database name for an app in +root+
+  # ("My-App" -> "my_app_development").
+  helper(:default_db_name) do |root = db_app_root|
+    "#{File.basename(File.expand_path(root)).downcase.gsub(/[^a-z0-9]+/, "_").gsub(/\A_+|_+\z/, "")}_development"
+  end
+
+  # Pure: true for a name that is safe to place in SQL and on a command
+  # line unquoted: lower-case letters, digits and underscores.
+  helper(:plain_db_name?) { |name| name.to_s.match?(/\A[a-z_][a-z0-9_]*\z/) }
+
+  # Why host:port/database may not be a database on this machine's own
+  # server, or nil when it is. Pure.
+  helper(:local_target_problem) do |host, port, database, tunnel_ports = TUNNEL_PORTS|
+    next "#{host} is not this machine (#{LOCAL_HOSTS.join(", ")} or a socket directory only)" unless
+      LOCAL_HOSTS.include?(host) || host.start_with?("/")
+    next "port #{port} is a database tunnel port (#{tunnel_ports.join(", ")}), which reaches a remote server" if
+      tunnel_ports.include?(port.to_s)
+    next "#{database.inspect} is not a plain database name" unless plain_db_name?(database)
+    next "#{database} is a system database" if SYSTEM_DBS.include?(database)
+
+    nil
+  end
+
+  # Where a dump of `database` taken at `time` goes:
+  # tmp/db-dumps/my_app_development-20261113-101500.dump (-schema for schema only).
+  helper(:dump_path) do |database, time = Time.now, schema_only = false|
+    File.join(dump_dir, "#{database}-#{time.strftime("%Y%m%d-%H%M%S")}#{"-schema" if schema_only}.dump")
+  end
+
+  # Newest full dump of `database` in `dir` (names sort by time; -schema dumps skipped), or nil.
+  helper(:local_newest_dump) do |dir, database|
+    Dir.glob(File.join(dir, "#{database}-*.dump"))
+       .select { File.basename(it).match?(/\A#{Regexp.escape(database)}-\d{8}-\d{4,6}\.dump\z/) }.max
+  end
+
+  # Host, port and user flags for the pg_* client tools. Pure.
+  helper(:local_pg_flags) { ["-h", LOCAL_DB_HOST, "-p", LOCAL_DB_PORT, "-U", LOCAL_DB_USER] }
+
+  # [stdout, success] of one SQL statement against a local database.
+  helper(:local_query) do |database, sql|
+    conninfo = "host=#{LOCAL_DB_HOST} port=#{LOCAL_DB_PORT} user=#{LOCAL_DB_USER} dbname=#{database}"
+    out, _err, status = Open3.capture3("psql", "-X", "-At", "-v", "ON_ERROR_STOP=1", "-c", sql, conninfo)
+    [out.strip, status.success?]
+  end
+
+  # Abort unless the target is local, the tools exist, the server answers, and
+  # the server itself says its address is loopback or a socket. A tunnel's far
+  # end reports the remote server's own address, so this catches one on a
+  # port DB_TUNNEL_PORTS does not list.
+  helper(:local_restore_guard) do |database|
+    problem = local_target_problem(LOCAL_DB_HOST, LOCAL_DB_PORT, database)
+    abort "Refusing to restore: #{problem}." if problem
+
+    missing = RESTORE_TOOLS.reject { |tool| system("which", tool, out: File::NULL, err: File::NULL) }
+    abort "Missing #{missing.join(", ")}: #{PG_INSTALL_HINT}" unless missing.empty?
+    unless system("pg_isready", "-q", "-h", LOCAL_DB_HOST, "-p", LOCAL_DB_PORT)
+      abort "PostgreSQL is not accepting connections on #{LOCAL_DB_HOST}:#{LOCAL_DB_PORT}: asgard db start"
+    end
+
+    addr, ok = local_query("postgres", "select coalesce(host(inet_server_addr()), 'socket')")
+    abort "Could not query the local server as #{LOCAL_DB_USER}." unless ok
+    abort "Refusing to restore: the server on port #{LOCAL_DB_PORT} reports address #{addr}, not this machine." unless
+      LOCAL_SERVERS.include?(addr)
+  end
+
+  # pg_dump a local database to dump_path(database), mode 600, so `asgard db
+  # dumps` lists it and `asgard db restore` restores it. The file, or nil (and
+  # no partial file) when pg_dump fails.
+  helper(:local_backup) do |database|
+    file = dump_path(database)
+    FileUtils.mkdir_p(File.dirname(file))
+    unless system("pg_dump", "-Fc", "--no-owner", *local_pg_flags, "-f", file, database)
+      FileUtils.rm_f(file)
+      next nil
+    end
+    File.chmod(0o600, file)
+    file
+  end
+
+  # Pure: the command that undoes a restore of +database+ from the backup
+  # at +saved+. DB_NAME is spelled out unless the database is the default.
+  helper(:local_restore_undo) do |database, saved, default = default_db_name|
+    "#{"DB_NAME=#{database} " unless database == default}asgard db restore #{saved}"
+  end
+
+  # Replace the local `database` with the dump at `path`, which came from
+  # `source`: "LOCAL" for a dump of this server, or a label such as
+  # "STAGING" for one taken elsewhere. opts: backup, jobs, yes, dry_run.
+  helper(:local_restore) do |path, database, source, opts|
+    abort "No such file: #{path}" unless File.file?(path)
+
+    local_restore_guard(database)
+    _out, _err, listed = Open3.capture3("pg_restore", "--list", path)
+    abort "#{path} is not a pg_dump custom-format archive pg_restore can read." unless listed.success?
+
+    exists = local_query("postgres", "select 1 from pg_database where datname = '#{database}'").first == "1"
+    backup = opts[:backup] && exists
+
+    puts <<~PLAN
+      Dump      #{path} (#{(File.size(path) / 1_048_576.0).round(1)} MB, #{File.mtime(path).strftime("%Y-%m-%d %H:%M")})
+      Target    #{database} on #{LOCAL_DB_HOST}:#{LOCAL_DB_PORT} as #{LOCAL_DB_USER} (LOCAL)#{" (does not exist yet)" unless exists}
+      Backup    #{backup ? "#{dump_dir}/#{database}-YYYYMMDD-HHMMSS.dump" : "none"}
+      Steps     drop #{database} (ending its connections, e.g. bin/dev), create it, pg_restore --jobs #{opts[:jobs]}
+    PLAN
+    next puts("Dry run: nothing changed.") if opts[:dry_run]
+    unless opts[:yes]
+      answer = Thor::Shell::Basic.new.ask("Replace your LOCAL #{database} with this #{source} data? Type #{database} to continue:")
+      abort "Aborted: nothing changed." unless answer.to_s.strip == database
+    end
+
+    if backup
+      saved = local_backup(database) || abort("Backup of #{database} failed; nothing was restored.")
+      puts "Backed up #{database} to #{saved}."
+    end
+    system("dropdb", "--if-exists", "--force", *local_pg_flags, database) || abort("dropdb #{database} failed.")
+    system("createdb", *local_pg_flags, database) || abort("createdb #{database} failed.")
+    restored = system("pg_restore", "--no-owner", "--no-privileges", "--jobs", opts[:jobs].to_s,
+                      *local_pg_flags, "-d", database, path)
+    abort "pg_restore reported errors (above); #{database} may be incomplete." unless restored
+
+    lines = ["Restored #{database} from #{path}."]
+    version, = local_query(database, "select max(version) from schema_migrations")
+    unless version.empty?
+      lines << "Latest migration in the dump: #{version}; run bin/rails db:migrate on a branch that is ahead of it."
+    end
+    unless source == "LOCAL"
+      # A dump taken elsewhere says it came from production or staging, so
+      # Rails would refuse db:reset and the like on it locally
+      # (ActiveRecord::ProtectedEnvironmentError).
+      _, relabelled = local_query(database, "update ar_internal_metadata set value = 'development' " \
+                                            "where key = 'environment'")
+      lines << (relabelled ? "ar_internal_metadata environment set to development." : "Could not relabel ar_internal_metadata; run bin/rails db:environment:set RAILS_ENV=development.")
+      lines << "#{database} now holds #{source} data: keep it on this machine."
+    end
+    lines << (saved ? "To put the previous #{database} back: #{local_restore_undo(database, saved)}" : "No backup was taken.")
+    puts lines
+  end
+end
+
+class DbCommands < Tasks
+  map "dump" => "backup"
+
+  # The database these tasks work on: DB_NAME, else Rails's default name
+  # for the app. Aborts on a name that is not plain, since it goes into SQL.
+  helper(:db_name) do
+    name = ENV.fetch("DB_NAME") { default_db_name }
+    abort "DB_NAME #{name.inspect} is not a plain database name (lower-case letters, digits, underscores)." unless plain_db_name?(name)
+    name
+  end
+
+  # Pure: what the app's databases have in common, so its cache, queue and
+  # cable siblings and its test database are listed with it
+  # ("my_app_development" -> "my_app").
+  helper(:db_family) { |name| name.sub(/_(development|test|staging|production)\z/, "") }
+
+  helper(:pg_guard) do
+    abort "psql not found — #{Tasks::PG_INSTALL_HINT}" unless system("which", "psql", out: File::NULL, err: File::NULL)
+    unless system("pg_isready", "-q", "-h", Tasks::LOCAL_DB_HOST, "-p", Tasks::LOCAL_DB_PORT)
+      abort "PostgreSQL is not accepting connections on #{Tasks::LOCAL_DB_HOST}:#{Tasks::LOCAL_DB_PORT} — asgard db start"
+    end
+  end
+
+  helper(:conninfo) do |dbname|
+    "host=#{Tasks::LOCAL_DB_HOST} port=#{Tasks::LOCAL_DB_PORT} user=#{Tasks::LOCAL_DB_USER} dbname=#{dbname}"
+  end
+
+  # Runs one SQL statement with psql's table output; aborts when it fails.
+  helper(:psql_table) do |dbname, sql|
+    system("psql", "-X", "-c", sql, conninfo(dbname)) || abort("psql failed against #{dbname}.")
+  end
+
+  # The database a dump file holds, from its DATABASE-YYYYMMDD-HHMM[SS][-schema].dump name. Pure.
+  helper(:dump_database) do |path|
+    File.basename(path).sub(/-\d{8}-\d{4}(\d\d)?(-schema)?\.dump\z/, "")
+  end
+
+  # Dump paths in the dump directory, of one database or all, newest first.
+  helper(:dump_files) do |database = nil|
+    Dir.glob(File.join(dump_dir, "#{database || "*"}-*.dump"))
+       .select { database.nil? || dump_database(it) == database }
+       .sort_by { File.basename(it) }.reverse
+  end
+
+  # The files beyond the newest `keep` of each database, for --keep; `files`
+  # come newest first, as dump_files returns them. Pure.
+  helper(:dumps_beyond) do |files, keep|
+    files.group_by { |file| dump_database(file) }.values.flat_map { |newest_first| newest_first.drop(keep) }
+  end
+
+  desc "status", "Server liveness, the app's database sizes and connections, latest migration"
+  def status
+    pg_guard
+    name   = db_name
+    family = db_family(name)
+    psql_table("postgres", <<~SQL)
+      SELECT d.datname AS database,
+             pg_size_pretty(pg_database_size(d.datname)) AS size,
+             (SELECT count(*) FROM pg_stat_activity a WHERE a.datname = d.datname) AS connections
+      FROM pg_database d
+      WHERE left(d.datname, #{family.length}) = '#{family}'
+      ORDER BY d.datname;
+    SQL
+    version, ok = local_query(name, "select max(version) from schema_migrations")
+    puts ok ? "Latest applied migration in #{name}: #{version.empty? ? "none" : version}" : "#{name} has no schema_migrations table (or does not exist)."
+  end
+
+  desc "tables", "Largest tables in the database by total size, with live row counts"
+  def tables
+    pg_guard
+    psql_table(db_name, <<~SQL)
+      SELECT relname AS table,
+             pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
+             n_live_tup AS live_rows
+      FROM pg_stat_user_tables
+      ORDER BY pg_total_relation_size(relid) DESC
+      LIMIT 20;
+    SQL
+  end
+
+  desc "psql", "Open psql connected to the database (DB_NAME=... to switch)"
+  def psql
+    pg_guard
+    system("psql", conninfo(db_name)) || abort("psql exited nonzero.")
+  end
+
+  desc "backup", "Snapshot the database with pg_dump -Fc into the dump directory (alias: dump)"
+  def backup
+    pg_guard
+    name = db_name
+    file = local_backup(name) || abort("pg_dump of #{name} failed; see its output above.")
+    puts "Wrote #{file} (#{format('%.1f', File.size(file) / 1_048_576.0)} MB)."
+  end
+
+  desc "backups", "List the database's snapshots, newest first (asgard db dumps lists every database)"
+  def backups
+    name  = db_name
+    files = dump_files(name)
+    return puts("No #{name} snapshots in #{dump_dir} — asgard db backup makes one.") if files.empty?
+
+    files.each { puts format("%10.1f MB  %s", File.size(it) / 1_048_576.0, it) }
+  end
+
+  desc "dumps [DATABASE]", "List every dump in the dump directory (or one DATABASE's), newest first; --keep N deletes the older ones"
+  method_option :keep, type: :numeric, desc: "Keep the newest N dumps of each database listed and delete the rest (0 deletes them all)"
+  method_option :yes,  type: :boolean, aliases: "-y", desc: "Do not ask before deleting"
+  def dumps(database = nil)
+    files = dump_files(database)
+    return puts("No #{"#{database} " if database}dumps in #{dump_dir}.") if files.empty?
+
+    keep = options[:keep]
+    abort "--keep must be a whole number, 0 or more." if keep && (keep.negative? || keep != keep.to_i)
+    doomed = keep ? dumps_beyond(files, keep.to_i) : []
+    files.each do |file|
+      puts format("%-7s %10.1f MB  %s", ("delete" if doomed.include?(file)), File.size(file) / 1_048_576.0, file)
+    end
+    return if doomed.empty?
+
+    unless options[:yes]
+      answer = Thor::Shell::Basic.new.ask("Delete the #{doomed.size} dump(s) marked above? Type yes to continue:")
+      abort "Aborted: nothing deleted." unless answer.to_s.strip == "yes"
+    end
+    FileUtils.rm_f(doomed)
+    puts "Deleted #{doomed.size} dump(s)."
+  end
+
+  desc "restore [DUMP]", "Restore the database from a dump (default: its newest full snapshot) — DESTRUCTIVE; " \
+                         "backs the current one up first"
+  method_option :backup,  type: :boolean, default: true, desc: "pg_dump the database to the dump directory first (--no-backup skips)"
+  method_option :jobs,    type: :numeric, default: 4, desc: "Parallel pg_restore jobs"
+  method_option :yes,     type: :boolean, aliases: "-y", desc: "Do not ask for confirmation"
+  method_option :dry_run, type: :boolean, desc: "Check the dump and the local server, then stop"
+  def restore(dump = nil)
+    name = db_name
+    path = dump ? File.expand_path(dump) : local_newest_dump(dump_dir, name)
+    abort "No #{name} snapshot in #{dump_dir} — asgard db backup makes one." if path.nil?
+
+    local_restore(path, name, "LOCAL", options)
+  end
+
+  # ---- schema diff of two dump files ------------------------------------------
+
+  # pg_dump stamps these into every archive; they differ between any two dumps.
+  @@diff_noise = /\A(\\restrict |\\unrestrict |-- Dumped (from|by) )/
+
+  # Schema-only SQL of a custom-format dump, without the per-dump noise.
+  helper(:db_diff_schema) do |path|
+    sql, err, status = Open3.capture3("pg_restore", "--schema-only", "--no-owner", "--no-privileges", "-f", "-", path)
+    abort "pg_restore could not read #{path}:\n#{err.strip}" unless status.success?
+
+    sql.lines.reject { it.match?(@@diff_noise) }.join
+  end
+
+  # {"TYPE name" => SQL} for each object pg_dump wrote under a
+  # "-- Name: NAME; Type: TYPE; ..." header, comments and blank lines dropped,
+  # so the comparison ignores the order objects were written in. Pure.
+  helper(:db_diff_objects) do |sql|
+    objects = Hash.new { |hash, key| hash[key] = +"" }
+    key = nil
+    sql.each_line do |line|
+      if (header = line.match(/\A-- Name: (?<name>.+?); Type: (?<type>[^;]+);/))
+        key = "#{header[:type]} #{header[:name]}"
+      elsif key && !line.start_with?("--") && !line.strip.empty?
+        objects[key] << line
+      end
+    end
+    objects
+  end
+
+  # [added, removed, changed] object keys going from `before` to `after`. Pure.
+  helper(:db_diff_compare) do |before, after|
+    shared = before.keys & after.keys
+    [(after.keys - before.keys).sort, (before.keys - after.keys).sort,
+     shared.reject { before[it] == after[it] }.sort]
+  end
+
+  # `diff -u` of two strings under two labels; "" when they match.
+  helper(:db_diff_text) do |a, b, label_a, label_b, context = 3|
+    Tempfile.create("db-diff-a") do |fa|
+      Tempfile.create("db-diff-b") do |fb|
+        fa.write(a)
+        fb.write(b)
+        [fa, fb].each(&:flush)
+        out, = Open3.capture2("diff", "-U#{context}", "--label", label_a, "--label", label_b, fa.path, fb.path)
+        out
+      end
+    end
+  end
+
+  desc "diff A.dump B.dump", "Show how the schema in B.dump differs from A.dump (pg_dump custom format; schema only, no data)"
+  method_option :sql, type: :boolean, desc: "Print the unified diff of the whole schema SQL instead of the per-object summary"
+  def diff(a_path, b_path)
+    paths = [a_path, b_path].map { File.expand_path(it) }
+    paths.each { |path| abort "No such file: #{path}" unless File.file?(path) }
+    abort "pg_restore not found: #{Tasks::PG_INSTALL_HINT}" unless system("which", "pg_restore", out: File::NULL, err: File::NULL)
+
+    a_sql, b_sql = paths.map { db_diff_schema(it) }
+    a_name, b_name = paths.map { File.basename(it) }
+    return puts("Schemas are identical.") if a_sql == b_sql
+    return puts(db_diff_text(a_sql, b_sql, a_name, b_name)) if options[:sql]
+
+    before, after = db_diff_objects(a_sql), db_diff_objects(b_sql)
+    added, removed, changed = db_diff_compare(before, after)
+    return puts("Same objects and definitions; only the order or comments differ (--sql shows it).") if
+      [added, removed, changed].all?(&:empty?)
+
+    puts "Schema of #{b_name} compared with #{a_name}:"
+    { "Added" => added, "Removed" => removed }.each do |title, keys|
+      next if keys.empty?
+
+      puts "", "#{title} (#{keys.size}):"
+      keys.each { puts "  #{it}" }
+    end
+    return if changed.empty?
+
+    puts "", "Changed (#{changed.size}):"
+    changed.each do |key|
+      puts "  #{key}"
+      lines = db_diff_text(before[key], after[key], a_name, b_name, 0).lines
+      lines.select { it.match?(/\A[-+](?![-+]{2} )/) }.each { puts "    #{it.chomp}" }
+    end
+  end
+
+  desc "start", "Start the local PostgreSQL server (pg_ctl; needs $PGDATA)"
+  def start
+    pgdata = ENV.fetch("PGDATA") { abort "PGDATA is not set — cannot locate the cluster." }
+    return puts("PostgreSQL already accepting connections on #{Tasks::LOCAL_DB_HOST}:#{Tasks::LOCAL_DB_PORT}.") if
+      system("pg_isready", "-q", "-h", Tasks::LOCAL_DB_HOST, "-p", Tasks::LOCAL_DB_PORT)
+
+    system("pg_ctl", "-D", pgdata, "-l", File.join(pgdata, "server.log"), "start") || abort("pg_ctl start failed.")
+  end
+
+  desc "stop", "Stop the local PostgreSQL server (pg_ctl; needs $PGDATA)"
+  def stop
+    pgdata = ENV.fetch("PGDATA") { abort "PGDATA is not set — cannot locate the cluster." }
+    system("pg_ctl", "-D", pgdata, "stop") || abort("pg_ctl stop failed.")
+  end
+end
+
+class Tasks
+  desc "db SUBCOMMAND", "Local development database: status, backups, restore, dump schema diff, server"
+  subcommand "db", DbCommands
+end

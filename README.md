@@ -78,7 +78,10 @@ whose `push` also pushes tags).
   | `gh` (authenticated) | `github_collect`; PR linkage in `branch_report` | `brew install gh`, then `gh auth login` |
   | `claude` | `weekly_report`, `shell_hourly` | Claude Code CLI, then `claude /login` once |
   | `icalBuddy` | `calendar_collect` | `brew install ical-buddy` |
+  | `jira` | most `ticket` tasks | `brew install jira-cli`, then `jira init` |
   | `tbls`, `pg_isready` | `db_doc*` tasks | `brew install k1LoW/tap/tbls`; PostgreSQL client tools |
+  | `psql`, `pg_dump`, `pg_restore`, `createdb`, `dropdb`, `pg_isready`, `pg_ctl` | `db` tasks | PostgreSQL client tools, e.g. `brew install postgresql` |
+  | `aws` (CLI v2) | `aws` tasks | `brew install awscli` |
   | `docker` | `fake_aws` tasks | Docker Desktop, or any Docker engine |
   | `mkdocs` | `doc` tasks in a MkDocs repo | `asgard doc install` (Homebrew) |
   | `typos` | `typos_check`, `typos_fix` | `brew install typos-cli` |
@@ -99,11 +102,14 @@ whose `push` also pushes tags).
 | `git.loki` | Per-repo git basics: `push`, `pull` (ff-only), `fetch` |
 | `doc_tasks.loki` | Documentation site tasks, for a repo with `mkdocs.yml` or `bridgetown.config.yml`: `doc install`, `doc build`, `doc serve`, `doc open` |
 | `client/status_report.loki` | End-of-week client status reporting: `daily_summary`, `weekly_report`, `shell_hourly` |
+| `client/ticket.loki` | Jira tickets from the command line: `asgard ticket show`, `mine`, `search`, `ffind`, `move`, `comment`, `history`, `ready`, `children`, `remaining`, `link`, `attach`, `detach`, `create`, `pr`, and more |
 | `iterm_tasks.loki` | Terminal fixes: `half_duplex_screen_fix`, `clear_scroll_back_buffer` |
 | `branch_report.loki` | `branch_report [DAYS]`: read-only Markdown report with one row per branch (local and origin copies together), sorted into Active, Stale (idle over DAYS, default 30) and Merged. Uses `gh`, when available, to recognize squash- and rebase-merged PRs |
+| `rails/db.loki` | Local PostgreSQL development database: `asgard db status`, `tables`, `psql`, `backup`, `backups`, `dumps`, `restore`, `diff`, `start`, `stop` |
 | `rails/db_doc.loki` | [tbls](https://github.com/k1LoW/tbls) schema docs into `notes/dbdoc` (needs Postgres up on localhost:5432; `DB_DOC_DSN` overrides the default vbr_development DSN): `db_doc`, `db_doc_diff`, `db_doc_mermaid`, `db_doc_open`, `db_doc_clean` |
 | `rails/dev.loki` | Background dev stack for a Rails app: `asgard dev up`, `down`, `status` (`bin/dev`, plus Mailpit when installed) |
 | `runbook.loki` | Operational runbooks in `docs/runbooks` (or `RUNBOOKS_DIR`): `asgard runbook list`, `asgard runbook show NAME` |
+| `aws.loki` | AWS SSO sign-in: `asgard aws login`, `logout`, `whoami`, `profiles`, `portal` |
 | `fake_aws.loki` | AWS's local API emulator in Docker (its Dockerfile and smoke test are in `fake_aws/`): `asgard fake_aws build`, `start`, `stop`, `restart`, `status`, `logs`, `version`, `exports`, `smoke`, `remove` |
 | `rubocop-strict.yml` | Cops kept enabled with no exclusions over `.rubocop_todo.yml` (when inherited after it; see below) |
 
@@ -236,6 +242,71 @@ schedule :shell_hourly, at: %w[10:00 11:00 12:00 13:00 14:00 15:00 16:00 17:00],
 
 `STATUS_DATE=2026-09-29 STATUS_HOUR=14 asgard shell_hourly` redoes one hour.
 
+### client/ticket.loki
+
+Jira from the command line, under `asgard ticket`. A ticket is named by its
+full key (`PROJ-175`, `proj-175`) or just its number (`175`), which gets
+`JIRA_PROJECT` as its prefix.
+
+- **Read**: `show KEY`, `comments KEY`, `history KEY`, `transitions KEY`,
+  `children EPIC`, `browser KEY` (alias `open`)
+- **Find**: `mine` (your open tickets), `search JQL` (alias `jql`),
+  `ffind [QUERY...]` (fuzzy match on key, title, status, assignee and
+  label), `remaining KEY` (a status table of KEY and every ticket created
+  after it; `--markdown` for a Markdown table)
+- **Change**: `move KEY TRANSITION` (by partial name, target status or id),
+  `comment KEY TEXT`, `ready KEY` (assignee, `--due`, `--estimate`),
+  `link A VERB B`, `attach KEY FILE...`, `detach KEY [NAME...]`,
+  `create TYPE SUMMARY`
+- **GitHub**: `pr KEY` lists the PRs whose title or branch names the ticket
+
+`detach` deletes attachments, which Jira cannot restore; with no name it
+only lists them.
+
+It needs [jira-cli](https://github.com/ankitpokhrel/jira-cli) set up with
+`jira init`, and these variables, usually from the project's `.envrc`:
+
+| Variable | Meaning |
+|----------|---------|
+| `JIRA_SITE` | The site URL, including `https://` |
+| `JIRA_USER_EMAIL` | Your Atlassian account's email |
+| `JIRA_API_KEY` | An Atlassian API token, used for the REST calls |
+| `JIRA_API_TOKEN` | The same token, under the name jira-cli reads |
+| `JIRA_PROJECT` | The project key, e.g. `PROJ` |
+| `JIRA_OPEN_COMMAND` | Optional: the browser command `--chrome` runs |
+| `JIRA_ACCEPTOR_FIELD` | Optional: the id of an "Acceptor" user custom field, which turns on `ready --acceptor` |
+| `JIRA_GITHUB_REPO` | Optional: `OWNER/REPO` for `pr`; default is the repo in the current directory |
+
+The file's header explains which tasks go through jira-cli and which
+through the REST API, and why.
+
+### aws.loki
+
+AWS IAM Identity Center (SSO) sign-in, under `asgard aws`:
+
+- `login`: `aws sso login` for the SSO session, so one sign-in covers
+  every profile that shares it; with `--profile NAME` it signs in through
+  that profile instead
+- `logout`: ends the SSO session and clears the cached credentials
+- `whoami` (alias `id`): the account and ARN the profile resolves to, and
+  when the SSO token expires
+- `profiles`: each profile in the config file with its account, role and
+  SSO session
+- `portal`: opens the SSO start page in the browser; `NO_OPEN=1` prints
+  the URL instead
+
+Every task takes `--profile NAME` (default `AWS_PROFILE`, else `default`)
+and `--sso-session NAME`. The session defaults to `AWS_SSO_SESSION`, else
+the one the profile names, else the config file's only `[sso-session]`
+section. The config file is `AWS_CONFIG_FILE`, else `~/.aws/config`.
+
+A project adds its own AWS tasks to the same group by reopening
+`AwsCommands` in its `.loki` after importing this file; `aws_json`
+(run an `aws` command and parse its JSON, with a hint when it fails) is
+there to build on. One thing to know when doing so: a `helper` block runs
+on the class, so it cannot read the running task's `options`. Code that
+needs them goes in a method inside `no_commands do ... end`.
+
 ### branch_report.loki
 
 `asgard branch_report [DAYS]` prints a Markdown report of every branch
@@ -267,6 +338,48 @@ the one whose name contains NAME (case-insensitive, `-` and `_` treated
 alike) in `glow` when installed, else `$PAGER`, else `less`. Off a terminal
 it prints the file instead. Set `RUNBOOKS_DIR` when the runbooks live
 somewhere else.
+
+### rails/db.loki
+
+Tasks for a Rails app's local PostgreSQL development database, under
+`asgard db`:
+
+- `status`: whether the server answers, the size and connection count of
+  each of the app's databases, and the latest applied migration
+- `tables`: the 20 largest tables, with live row counts
+- `psql`: a psql session on the database
+- `backup` (alias `dump`): a `pg_dump -Fc` snapshot in the dump directory,
+  named `DATABASE-YYYYMMDD-HHMMSS.dump`, mode 600
+- `backups`: this database's snapshots; `dumps [DATABASE]` lists every
+  database's, and `dumps --keep N` deletes all but each one's newest N
+  (it asks first; `-y` skips the question)
+- `restore [DUMP]`: replaces the database with a snapshot, by default its
+  newest. This drops the database. It first backs the current one up
+  (`--no-backup` skips that), prints what it will do, and asks you to type
+  the database's name (`-y` skips the question). `--dry-run` stops after
+  the checks. It prints the command that puts the previous database back
+- `diff A.dump B.dump`: how the schema in B differs from A, as objects
+  added, removed and changed; `--sql` prints the unified diff of the whole
+  schema instead. It reads the two files only
+- `start`, `stop`: `pg_ctl` on the cluster in `$PGDATA`
+
+Settings come from the environment:
+
+| Variable | Meaning | Default |
+|----------|---------|---------|
+| `DB_NAME` | The database | `<app directory>_development`, the app directory being `RR` or the current directory |
+| `DB_HOST`, `DB_PORT` | The server | `localhost`, `5432` |
+| `DB_USER` | The role | `PGUSER`, else your login name |
+| `DB_DUMP_DIR` | Where dumps go | `tmp/db-dumps` in the app directory |
+| `DB_TUNNEL_PORTS` | Comma-separated local ports that forward to a remote database | none |
+
+`restore` refuses to run unless the target is on this machine: the host
+must be `localhost` or a socket directory, the port must not be in
+`DB_TUNNEL_PORTS`, the database must not be a system one, and the server
+itself must report a loopback or socket address. The last check catches a
+tunnel to a remote server on a port that was not listed.
+
+Keep the dump directory out of git: a dump is a full copy of the data.
 
 ### rails/dev.loki
 
