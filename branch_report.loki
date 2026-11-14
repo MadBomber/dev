@@ -1,5 +1,3 @@
-# linda-crnic/vbr/branch_report.loki
-#
 # Status of every local and remote branch: last activity, ahead/behind the
 # default branch, and merge state — so stale and already-merged branches are
 # easy to spot before cleanup. Read-only; never deletes, pushes, or fetches.
