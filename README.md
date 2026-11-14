@@ -81,10 +81,12 @@ whose `push` also pushes tags).
 Universal gem lifecycle tasks. Uses the `gem` command directly — no rake
 dependency. `@@gem_name` defaults to the gemspec's basename (falling back to
 the directory name); a repo may set it earlier if it differs. A `gem_version`
-helper reads `VERSION` from `lib/<gem_name>/version.rb` (dashes become
-slashes), falling back to the first `lib/**/version.rb` that defines it.
+helper takes the version from the gemspec, falling back to a string `VERSION`
+in `lib/<gem_name>/version.rb` (dashes become slashes), then in the first
+`lib/**/version.rb` that defines it.
 
-- `build` — builds the gemspec into `pkg/<name>-<version>.gem`
+- `build` — builds the gemspec into `pkg/<name>-<version>.gem`; aborts if no
+  version can be determined
 - `install` — builds, then `gem install --local`
 - `release` — runs the `quality` gate and `build`, aborts if no version can
   be determined, confirms (skip with `-y`), requires a clean working tree and an unused `v<version>` tag, then tags,

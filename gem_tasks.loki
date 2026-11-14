@@ -13,16 +13,29 @@ class Tasks
                    File.basename(Dir.pwd).freeze
                  end
 
-  # Prefers lib/<gem_name with - as />/version.rb, then the first version.rb
-  # that actually defines VERSION.
+  # The version `gem build` will use: the gemspec's own, so a computed VERSION
+  # (e.g. `[0, 1, 0].join(".")`) still names the file right. Falls back to a
+  # string literal in lib/<gem_name with - as />/version.rb, then in the first
+  # version.rb that defines VERSION, then "?.?.?".
   helper(:gem_version) do
+    gemspec_version(Dir.glob("*.gemspec").first) || version_rb_literal || "?.?.?"
+  end
+
+  # nil when there is no gemspec or it doesn't load (RubyGems warns why).
+  helper(:gemspec_version) do |gemspec|
+    version = gemspec && Gem::Specification.load(gemspec)&.version&.to_s
+    version unless version.to_s.empty?
+  rescue StandardError
+    nil
+  end
+
+  helper(:version_rb_literal) do
     pattern = /VERSION\s*=\s*['"]([^'"]+)['"]/
     preferred = "lib/#{@@gem_name.tr('-', '/')}/version.rb"
     candidates = [preferred, *Dir.glob("lib/**/version.rb")].uniq.select { File.file?(it) }
-    version = candidates.lazy.map { File.read(it)[pattern, 1] }.find { it && !it.empty? }
-    version || "?.?.?"
+    candidates.lazy.map { File.read(it)[pattern, 1] }.find { it && !it.empty? }
   rescue StandardError
-    "?.?.?"
+    nil
   end
 
   desc "Open IRB console with gem loaded"
@@ -42,9 +55,11 @@ class Tasks
   def build
     gemspec = Dir.glob("*.gemspec").first
     abort "No gemspec found in #{Dir.pwd}." unless gemspec
+    version = gem_version
+    abort "Cannot determine #{@@gem_name}'s version from #{gemspec} or lib/**/version.rb." if version == "?.?.?"
 
     FileUtils.mkdir_p("pkg")
-    sh "gem build #{gemspec} --output pkg/#{@@gem_name}-#{gem_version}.gem"
+    sh "gem build #{gemspec} --output pkg/#{@@gem_name}-#{version}.gem"
   end
 
   desc "Build and install gem locally"
