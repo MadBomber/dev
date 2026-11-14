@@ -9,6 +9,21 @@
 # rails/quality_rails.loki's brakeman_check, once a Rails project imports that
 # file (see its header), or a component's own archspec_check) is picked up
 # too, with no need to redeclare or extend anything.
+#
+# Display: on a TTY with the tty-spinner gem installed for asgard's Ruby,
+# `quality` first draws a live board with one spinner row per gate
+# (quality_board), and each gate settles its own row with a badge and a
+# one-line note as it finishes. Off a TTY (CI, a pipe) or without the gem
+# there is no board and every gate prints "Label: note". Gates never `puts`
+# directly — a stray line while the board is spinning would throw off its
+# cursor moves — they report through run_gate / report_gate / finish_gate /
+# skip_gate.
+
+require "etc"
+require "fileutils"
+require "open3"
+require "shellwords"
+require "stringio"
 
 class Tasks
   # Directories the structural gates (flog / flay / reek / fasterer) scan.
@@ -17,14 +32,58 @@ class Tasks
   # assignment: @@quality_dirs = %w[app lib].freeze
   @@quality_dirs ||= %w[lib].freeze
 
-  desc "Run the test suite"
+  # A gate whose tool blows up (a gem that no longer activates against the
+  # current Ruby, a Gem::ConflictError, a crash inside the tool) must not
+  # take the whole quality run down with a stack trace: the other gates'
+  # results and the summary would be lost. Any exception out of a *_check
+  # task is written to that gate's _output.txt, exception and backtrace, and
+  # the gate reports GATE_CRASH_STATUS. That is :fail — a gate that could
+  # not run has not passed, and a WARN would let a broken gate through
+  # silently (the same reasoning as quality_check_status). Prepended on
+  # invoke_command, not defined in the class: asgard 0.6.0 refuses a task or
+  # helper of that name. SystemExit and Interrupt pass through: `abort` and
+  # Ctrl-C keep their meaning.
+  GATE_CRASH_STATUS = :fail
+
+  module GateGuard
+    def invoke_command(command, *)
+      return super unless command.name.end_with?("_check")
+
+      super
+    rescue StandardError, ScriptError => e
+      gate   = command.name.delete_suffix("_check")
+      output = "#{gate}_output.txt"
+      File.write(output, gate_crash_text(quality_gate_label(command.name), e))
+      finish_gate(gate.to_sym, quality_gate_label(command.name), GATE_CRASH_STATUS,
+                  "could not run: #{e.class}: #{e.message.lines.first.to_s.strip} (see #{output})")
+    end
+  end
+  prepend GateGuard
+
+  # Loaded into each parallel_rspec process through SPEC_OPTS, so the app
+  # under test carries no code for the progress bar.
+  TEST_PROGRESS_LISTENER = File.expand_path("quality/test_progress_listener.rb", __dir__)
+
+  # test_check picks its runner from the repo (see test_runner):
+  #   :minitest        bundle exec rake test                  (the default)
+  #   :rspec           bundle exec rspec                      (spec/ + rspec-core bundled)
+  #   :parallel_rspec  bundle exec parallel_rspec -n N spec   (… + parallel_tests bundled)
+  # Both RSpec runners set COVERAGE=true, the usual switch for a SimpleCov
+  # setup with minimum-coverage thresholds, so a coverage drop fails the
+  # gate too. The parallel run clears coverage/ first so a stale result
+  # cannot merge in; PARALLEL_TEST_PROCESSORS sets the process count
+  # (default: CPU count, at most 8). On the live board its row's note is a
+  # progress bar: each process writes "done total" under tmp/test_progress/
+  # and run_gate redraws the note from those files.
+  desc "Run the test suite (minitest, RSpec, or parallel RSpec with a progress bar)"
   def test_check
-    output = `bundle exec rake test 2>&1`
-    result = $?.success? ? :pass : :fail
-    File.write("test_output.txt", output)
-    summary = output.lines.reverse.find { |l| l =~ /\d+ runs,/ }&.strip || result.to_s
-    puts "Tests: #{summary} (see test_output.txt)"
-    result
+    case test_runner
+    when :minitest then run_gate(:test, "Tests", "bundle exec rake test", summary: /\d+ runs,/)
+    when :rspec
+      run_gate(:test, "Tests", "bundle exec rspec", summary: /\d+ examples?,/,
+               env: project_ruby_env.merge("COVERAGE" => "true"))
+    else parallel_rspec_gate
+    end
   end
 
   desc "Run the test suite with verbose output"
@@ -32,35 +91,69 @@ class Tasks
     sh "bundle exec rake test_verbose"
   end
 
+  # Every *_check task, in the order the summary lists them.
+  def self.quality_checks = all_commands.keys.grep(/_check\z/).sort.map(&:to_sym)
+
   desc "Run every *_check quality gate task in parallel"
   # A Proc defers resolution to validate_deps!, after every .loki file has
   # loaded — so a *_check task from another file is picked up too, with no
   # need to redeclare anything here.
-  depends_on -> { [all_commands.keys.grep(/_check\z/).sort.map(&:to_sym)] }
+  # quality_board runs first so every gate has its row before any starts.
+  depends_on -> { [:quality_board, quality_checks] }
   def quality
-    check_tasks = self.class._deps.fetch(:quality, []).flatten.map(&:to_s)
-
-    results = check_tasks.to_h do |name|
-      [quality_gate_label(name), quality_check_status(name, dep_result(name))]
+    results = dep_results.except(:quality_board).sort.to_h do |name, status|
+      [quality_gate_label(name.to_s), quality_check_status(name.to_s, status)]
     end
 
-    print_quality_summary(results)
+    print_quality_summary(results, rows: QUALITY_BOARD.empty?)
+  end
+
+  # Gate task name => its spinner row; empty unless quality_board drew one.
+  QUALITY_BOARD = {}
+
+  desc "Draw the live quality board: one spinner row per gate", hide: true
+  def quality_board
+    return unless $stdout.tty?
+
+    require "io/console"
+    begin
+      require "tty-spinner"
+    rescue LoadError
+      # No board without the gem: every gate falls back to "Label: note" lines.
+      return
+    end
+
+    print_quality_header
+    labels = self.class.quality_checks.to_h { |check| [check, quality_gate_label(check.to_s)] }
+    width  = labels.values.map(&:length).max
+    board  = TTY::Spinner::Multi.new(output: $stdout, hide_cursor: true, success_mark: "",
+                                     frames: %w[●··· ·●·· ··●· ···● ··●· ·●··])
+    labels.each do |check, label|
+      pattern = "  [:spinner:badge] #{label.ljust(width)}  :note"
+      # A gate with a progress note gets a still frame and no spin thread:
+      # the spinner's line clear on every update, waiting up to a tick for
+      # the redraw, made the row flash. capture_gate redraws it instead.
+      progress = progress_gate?(check)
+      row = progress ? board.register(pattern, frames: ["····"]) : board.register(pattern)
+      row.update(badge: "", note: "")
+      progress ? row.spin : row.auto_spin
+      QUALITY_BOARD[check] = row
+    end
   end
 
   desc "Check code style with RuboCop"
   def rubocop_check
-    output = `RUBOCOP_CACHE_ROOT=tmp/rubocop_cache bundle exec rubocop 2>&1`
-    result = $?.success? ? :pass : :fail
-    File.write("rubocop_output.txt", output)
-    summary = output.lines.find { |l| l =~ /files inspected/ }&.strip || result.to_s
-    puts "RuboCop: #{summary} (see rubocop_output.txt)"
-    result
+    run_gate(:rubocop, "RuboCop", "RUBOCOP_CACHE_ROOT=tmp/rubocop_cache bundle exec rubocop", summary: /files inspected/)
   end
 
   desc "Auto-correct RuboCop offenses"
   def rubocop_fix
     sh "RUBOCOP_CACHE_ROOT=tmp/rubocop_cache bundle exec rubocop -a"
   end
+
+  FLOG_WARN = 20.0
+  FLOG_FAIL = 50.0
+  FLAY_MASS = 150
 
   desc "Check code complexity with Flog (warn >=20, fail >=50)"
   # Runs flog in a subprocess rather than `require "flog"` in this process:
@@ -69,76 +162,46 @@ class Tasks
   # the other raised Gem::ConflictError. A subprocess lets the project's bundle
   # (or the global flog when the project does not bundle it) pick its own prism.
   def flog_check
-    method_warn = 20.0
-    method_fail = 50.0
-
     flog =
       if bundled_gem?("flog")
         "bundle exec flog"
       elsif command_available?("flog")
         "flog"
       else
-        return skip_flog
+        return skip_gate(:flog, "Flog Complexity", "flog not found in the bundle or on PATH. Install it with `gem install flog`.")
       end
-    output = `#{flog} --all --methods-only --quiet #{@@quality_dirs.join(' ')} 2>&1`
-    unless $?.success?
-      File.write("flog_output.txt", output)
-      puts "Flog: failed to run (see flog_output.txt)"
-      return :fail
-    end
+    output, status = Open3.capture2e(project_ruby_env, "#{flog} --all --methods-only --quiet #{@@quality_dirs.join(' ')}")
+    return report_gate(:flog, "Flog Complexity", output, :fail, ->(*) { "failed to run" }) unless status.success?
 
-    warnings = []
-    failures = []
-
-    # "   99.8: Pgdd::Report#table_page   lib/pgdd/report.rb:214-249"; the
-    # "flog total" and "flog/method average" lines carry no class or method
-    output.each_line do |line|
-      next unless (m = line.match(/\A\s*(\d+(?:\.\d+)?):\s+(\S+)\s+\S+/))
-      score, method_name = m[1].to_f, m[2]
-      next unless method_name.include?("#") || method_name.include?("::")
-      next if method_name.end_with?("#none")
-      if score >= method_fail
-        failures << "#{"%.1f" % score}: #{method_name}"
-      elsif score >= method_warn
-        warnings << "#{"%.1f" % score}: #{method_name}"
-      end
-    end
-
-    result = failures.empty? ? :pass : :fail
-
-    lines = ["Flog warnings (#{method_warn}–#{method_fail}):"]
+    warnings, failures = flog_findings(output)
+    lines = ["Flog warnings (#{FLOG_WARN}–#{FLOG_FAIL}):"]
     lines.concat(warnings.empty? ? ["  (none)"] : warnings.map { |w| "  #{w}" })
     lines << ""
-    lines << "Flog failures (>= #{method_fail}):"
+    lines << "Flog failures (>= #{FLOG_FAIL}):"
     lines.concat(failures.empty? ? ["  (none)"] : failures.map { |f| "  #{f}" })
-    File.write("flog_output.txt", "#{lines.join("\n")}\n")
 
-    puts "Flog: #{failures.size} failure(s), #{warnings.size} warning(s) (see flog_output.txt)"
-    result
+    report_gate(:flog, "Flog Complexity", "#{lines.join("\n")}\n", failures.empty? ? :pass : :fail,
+                ->(*) { "#{failures.size} failure(s), #{warnings.size} warning(s)" })
   end
 
   desc "Check for structural code duplication with Flay (mass >= 150)"
   def flay_check
-    return skip_flay unless gem_loadable?("flay")
+    return skip_gate(:flay, "Flay Duplication", in_process_gem_hint("flay")) unless gem_loadable?("flay")
     require "flay" # no-op once loaded; keeps Flay below independent of the guard
 
-    mass_threshold = 150
-
-    flay = Flay.new(mass: mass_threshold, diff: false, verbose: false, summary: false, timeout: 60)
+    flay = Flay.new(mass: FLAY_MASS, diff: false, verbose: false, summary: false, timeout: 60)
     flay.process(*quality_source_files)
     flay.analyze
 
     result = flay.hashes.empty? ? :pass : :fail
-
-    File.open("flay_output.txt", "w") do |f|
+    output =
       if result == :pass
-        f.puts "Flay: no structural duplication detected (mass >= #{mass_threshold})"
+        "Flay: no structural duplication detected (mass >= #{FLAY_MASS})\n"
       else
-        flay.report(f)
+        StringIO.new.tap { |io| flay.report(io) }.string
       end
-    end
-    puts "Flay: #{flay.hashes.size} duplication pattern(s) found (mass >= #{mass_threshold}) (see flay_output.txt)"
-    result
+    report_gate(:flay, "Flay Duplication", output, result,
+                ->(*) { "#{flay.hashes.size} duplication pattern(s) found (mass >= #{FLAY_MASS})" })
   end
 
   # Grandfathered Reek smell counts: reek_baseline writes it, reek_check reads it.
@@ -146,7 +209,7 @@ class Tasks
 
   desc "Check code smells with Reek (fails only on new/worsened files vs .quality/reek_baseline.txt)"
   def reek_check
-    return skip_reek unless gem_loadable?("reek")
+    return skip_gate(:reek, "Reek Smells", in_process_gem_hint("reek")) unless gem_loadable?("reek")
 
     config = reek_configuration
     current = reek_smell_counts(reek_source_files(config), config)
@@ -170,16 +233,13 @@ class Tasks
       lines << ""
       lines << "Fix smells, or run `asgard reek_baseline` if intentional."
     end
-    File.write("reek_output.txt", "#{lines.join("\n")}\n")
-
     summary =
       if result == :pass
         "#{current.values.sum} total warning(s) (#{baseline.values.sum} grandfathered across #{baseline.size} file(s))"
       else
         "#{new_files.size + worsened.size} file(s) regressed"
       end
-    puts "Reek: #{summary} (see reek_output.txt)"
-    result
+    report_gate(:reek, "Reek Smells", "#{lines.join("\n")}\n", result, ->(*) { summary })
   end
 
   desc "Regenerate .quality/reek_baseline.txt (grandfathers current Reek smell counts per file)"
@@ -198,13 +258,9 @@ class Tasks
   def typos_check
     return skip_typos unless command_available?("typos")
 
-    output = `typos 2>&1`
-    result = $?.success? ? :pass : :fail
-    File.write("typos_output.txt", output)
-    count   = output.lines.count { |l| l.start_with?("error:") }
-    summary = result == :pass ? "no typos found" : "#{count} typo(s) found"
-    puts "Typos: #{summary} (see typos_output.txt)"
-    result
+    run_gate(:typos, "Typos", "typos", summary: lambda { |output, result|
+      result == :pass ? "no typos found" : "#{output.lines.count { |l| l.start_with?("error:") }} typo(s) found"
+    })
   end
 
   desc "Auto-correct typos"
@@ -216,40 +272,31 @@ class Tasks
 
   desc "Check ERB templates for style and safety issues with ERBLint"
   def erb_lint_check
-    return skip_erb_lint if Dir.glob("**/*.erb").empty?
-    return skip_erb_lint_gem unless bundled_gem?("erb_lint")
+    return skip_gate(:erb_lint, "ERBLint", "no .erb files found.") if Dir.glob("**/*.erb").empty?
+    return skip_gate(:erb_lint, "ERBLint", not_bundled_hint("erb_lint")) unless bundled_gem?("erb_lint")
 
     # --enable-all-linters overrides a repo's own .erb_lint.yml, which defeats
     # the point of a repo opting into its own linter selection (e.g. disabling
     # HardCodedString in a single-locale app). Only force every linter on for
     # repos that haven't made that choice for themselves.
     flags = File.exist?(".erb_lint.yml") ? "--lint-all" : "--lint-all --enable-all-linters"
-    output = `bundle exec erb_lint #{flags} 2>&1`
-    result = $?.success? ? :pass : :fail
-    File.write("erb_lint_output.txt", output)
-    summary = output.lines.reverse.find { |l| l =~ /error\(s\)|no errors were found/i }&.strip || result.to_s
-    puts "ERBLint: #{summary} (see erb_lint_output.txt)"
-    result
+    run_gate(:erb_lint, "ERBLint", "bundle exec erb_lint #{flags}", summary: /error\(s\)|no errors were found/i)
   end
 
   desc "Check for performance suggestions with Fasterer"
   def fasterer_check
-    return skip_fasterer unless bundled_gem?("fasterer")
+    return skip_gate(:fasterer, "Fasterer", not_bundled_hint("fasterer")) unless bundled_gem?("fasterer")
 
-    output = `bundle exec fasterer #{@@quality_dirs.join(' ')} 2>&1`.gsub(/\e\[\d+m/, "")
-    result = $?.success? ? :pass : :warn
-    File.write("fasterer_output.txt", output)
-    summary = output.lines.find { |l| l =~ /files? inspected/ }&.strip || result.to_s
-    puts "Fasterer: #{summary} (see fasterer_output.txt)"
-    result
+    run_gate(:fasterer, "Fasterer", "bundle exec fasterer #{@@quality_dirs.join(' ')}",
+             summary: /files? inspected/, on_fail: :warn)
   end
 
   desc "Check Minitest test structure with SCRAP (scrap4rb)"
   def scrap_check
-    require "shellwords"
-
     test_files = scrap_test_files
-    return skip_scrap_tests if test_files.empty?
+    if test_files.empty?
+      return skip_gate(:scrap, "SCRAP", "no Minitest files (test/**/*_test.rb or test/**/test_*.rb) found.")
+    end
 
     command =
       if bundled_gem?("scrap4rb")
@@ -257,14 +304,11 @@ class Tasks
       elsif command_available?("scrap4rb")
         "scrap4rb"
       else
-        return skip_scrap
+        return skip_gate(:scrap, "SCRAP", "scrap4rb not found in the bundle or on PATH. Install it with `gem install scrap4rb`.")
       end
-    output = `#{command} #{test_files.shelljoin} 2>&1`
-    File.write("scrap_output.txt", output)
-    result = scrap_result(output, $?.success?)
-    summary = output.lines.find { |l| l =~ /\d+ files?, \d+ tests?/ }&.strip || result.to_s
-    puts "SCRAP: #{summary} (see scrap_output.txt)"
-    result
+    # scrap4rb exits 0 even when it has advice, so status: reads its totals.
+    run_gate(:scrap, "SCRAP", "#{command} #{test_files.shelljoin}", summary: /\d+ files?, \d+ tests?/,
+             on_fail: :warn, status: ->(output) { scrap_result(output, true) })
   end
 
   desc "Check Gemfile.lock for known vulnerabilities with bundler-audit"
@@ -280,7 +324,7 @@ class Tasks
       if File.exist?("bin/bundler-audit")
         "bin/bundler-audit"
       elsif !File.exist?(bundle_lockfile)
-        return skip_bundler_audit_lockfile
+        return skip_gate(:bundler_audit, "Bundler Audit", "no #{bundle_lockfile} found.")
       elsif bundled_gem?("bundler-audit")
         # --gemfile-lock here too: without it bundle-audit defaults to
         # ./Gemfile.lock even when the bundle is running from Gemfile.local,
@@ -289,27 +333,21 @@ class Tasks
       elsif command_available?("bundle-audit")
         "bundle-audit check --update --gemfile-lock #{bundle_lockfile}"
       else
-        return skip_bundler_audit
+        return skip_gate(:bundler_audit, "Bundler Audit",
+                         "bundler-audit not found in the bundle or on PATH. Install it with `gem install bundler-audit`.")
       end
-    output = `#{command} 2>&1`
-    result = $?.success? ? :pass : :fail
-    File.write("bundler_audit_output.txt", output)
-    summary = output.lines.reverse.find { |l| l =~ /vulnerabilit/i }&.strip || result.to_s
-    puts "Bundler Audit: #{summary} (see bundler_audit_output.txt)"
-    result
+    run_gate(:bundler_audit, "Bundler Audit", command, summary: /vulnerabilit/i)
   end
 
   desc "Check architecture boundaries with ArchSpec"
   def archspec_check
-    return skip_archspec unless command_available?("archspec") && File.exist?("Archspec.rb")
+    unless command_available?("archspec")
+      return skip_gate(:archspec, "ArchSpec", "`archspec` command not found. Install it with `gem install archspec` " \
+                                              "and run `archspec init` to generate an Archspec.rb.")
+    end
+    return skip_gate(:archspec, "ArchSpec", "no Archspec.rb found. Run `archspec init` to generate one.") unless File.exist?("Archspec.rb")
 
-    output = `archspec check 2>&1`
-    result = $?.success? ? :pass : :fail
-    File.write("archspec_output.txt", output)
-    summary = output.lines.reverse.find { |l| l =~ /architecture violations? found|ArchSpec passed/i }&.strip ||
-      result.to_s
-    puts "ArchSpec: #{summary} (see archspec_output.txt)"
-    result
+    run_gate(:archspec, "ArchSpec", "archspec check", summary: /architecture violations? found|ArchSpec passed/i)
   end
 
   # Curated display labels for the *_check tasks defined in this file. A
@@ -325,12 +363,232 @@ class Tasks
     "erb_lint_check" => "ERBLint",
     "scrap_check"    => "SCRAP Test Structure",
     "archspec_check" => "ArchSpec",
+    "ard_check"      => "ActiveRecordDoctor", # rails/quality_rails.loki; the fallback would read "Ard"
   }.freeze
 
   no_commands do
     # Ruby files under the configured @@quality_dirs.
     def quality_source_files
       @@quality_dirs.flat_map { |dir| Dir.glob("#{dir}/**/*.rb") }
+    end
+
+    # Pure: which runner test_check uses, from what the repo has.
+    def test_runner(spec: Dir.exist?("spec"), rspec: bundled_gem?("rspec-core"),
+                    parallel: bundled_gem?("parallel_tests"))
+      return :minitest unless spec && rspec
+
+      parallel ? :parallel_rspec : :rspec
+    end
+
+    # true for a gate whose board row is a live progress bar (run_gate's
+    # progress:), so the row shows a still frame instead of a spinner.
+    def progress_gate?(check, runner = test_runner)
+      check == :test_check && runner == :parallel_rspec
+    end
+
+    # Processes for the parallel suite: PARALLEL_TEST_PROCESSORS, else the
+    # CPU count capped at 8, and never more than there are spec files
+    # (parallel_tests starts no process without a file to run).
+    def parallel_test_processes(spec_files = Dir.glob("spec/**/*_spec.rb").size,
+                                wanted = ENV.fetch("PARALLEL_TEST_PROCESSORS") { [Etc.nprocessors, 8].min })
+      [Integer(wanted), [spec_files, 1].max].min
+    end
+
+    # The parallel_rspec command line test_check runs.
+    def parallel_rspec_command(processes = parallel_test_processes)
+      "bundle exec parallel_rspec -n #{Integer(processes)} spec"
+    end
+
+    # test_check's :parallel_rspec runner (see the comment above test_check).
+    def parallel_rspec_gate
+      FileUtils.rm_rf("coverage")
+      progress_dir = File.expand_path("tmp/test_progress")
+      FileUtils.rm_rf(progress_dir)
+      FileUtils.mkdir_p(progress_dir)
+      processes = parallel_test_processes
+      env = project_ruby_env.merge("COVERAGE" => "true", "TEST_PROGRESS_DIR" => progress_dir,
+                                   "SPEC_OPTS" => "--require #{TEST_PROGRESS_LISTENER.shellescape}")
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      progress = lambda do
+        elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+        test_progress_note(*test_progress(progress_dir), elapsed, processes:)
+      end
+      run_gate(:test, "Tests + Coverage", parallel_rspec_command(processes), summary: /\d+ examples?,/, env:, progress:)
+    end
+
+    # [done, total, processes reported] summed over the "done total" files
+    # in +dir+; a file not yet written or mid-rename is skipped.
+    def test_progress(dir)
+      counts = Dir.glob(File.join(dir, "*.txt")).filter_map do |file|
+        done, total = File.read(file).split.map { Integer(it) }
+        [done, total] if total
+      rescue Errno::ENOENT, ArgumentError, TypeError
+        nil
+      end
+      [counts.sum(&:first), counts.sum(&:last), counts.size]
+    end
+
+    # Pure: the board note for a run +elapsed+ seconds in, e.g.
+    # "[██████░░░░░░░░░░] 1062/2833  0:23 left". The time left assumes the
+    # remaining examples run at the rate so far. Until every process has
+    # reported its count the total is unknown, so it says so instead.
+    def test_progress_note(done, total, reported, elapsed, processes: parallel_test_processes, width: 16)
+      clock = ->(seconds) { format("%d:%02d", *seconds.round.divmod(60)) }
+      return "booting #{reported}/#{processes} processes… #{clock.(elapsed)}" if reported < processes || total.zero?
+
+      filled = (width * done / total.to_f).floor
+      bar    = "[#{"█" * filled}#{"░" * (width - filled)}] #{done}/#{total}"
+      return "#{bar}  #{clock.(elapsed)} elapsed" if done.zero?
+      return "#{bar}  finishing…" if done >= total
+
+      "#{bar}  #{clock.(elapsed * (total - done) / done)} left"
+    end
+
+    # Environment that runs a child `bundle exec` on the project's own Ruby.
+    # asgard runs under rbenv, whose shim exports RBENV_VERSION and puts its
+    # own Ruby's bin/ first on PATH, so in a project whose .ruby-version
+    # differs a child `bundle` would be asgard's Ruby and fail on bundler's
+    # RubyVersionMismatch before the tool runs. Empty (inherit everything)
+    # when +dir+ has no .ruby-version, rbenv is not on PATH, or rbenv does
+    # not have that version installed.
+    def project_ruby_env(dir = Dir.pwd)
+      file = File.join(dir, ".ruby-version")
+      return {} unless File.exist?(file) && command_available?("rbenv")
+
+      version   = File.read(file).strip.delete_prefix("ruby-") # rbenv accepts the prefix in the file, not in RBENV_VERSION
+      prefix, _ = Open3.capture2({ "RBENV_VERSION" => version }, "rbenv", "prefix", err: File::NULL)
+      return {} if prefix.strip.empty?
+
+      { "RBENV_VERSION" => version, "PATH" => "#{prefix.strip}/bin:#{ENV.fetch("PATH")}" }
+    end
+
+    # Pure: [warnings, failures] from `flog --all --methods-only` output,
+    # each a "score: Class#method" string. A line looks like
+    # "   99.8: Pgdd::Report#table_page   lib/pgdd/report.rb:214-249"; the
+    # "flog total" and "flog/method average" lines carry no class or method.
+    def flog_findings(output, warn: FLOG_WARN, fail: FLOG_FAIL)
+      warnings = []
+      failures = []
+      output.each_line do |line|
+        next unless (m = line.match(/\A\s*(\d+(?:\.\d+)?):\s+(\S+)\s+\S+/))
+
+        score, method_name = m[1].to_f, m[2]
+        next unless method_name.include?("#") || method_name.include?("::")
+        next if method_name.end_with?("#none")
+
+        if score >= fail
+          failures << "#{"%.1f" % score}: #{method_name}"
+        elsif score >= warn
+          warnings << "#{"%.1f" % score}: #{method_name}"
+        end
+      end
+      [warnings, failures]
+    end
+
+    # Runs +command+ as one gate: saves its output (stdout and stderr, color
+    # codes removed) to <name>_output.txt, settles the gate's row (or prints
+    # "Label: summary") and returns +on_fail+ when the command exits
+    # non-zero. Otherwise it returns :pass, or what +status+ (a callable
+    # given the output) says, for a tool whose exit status ignores its
+    # findings. +env+ is merged into the command's environment (default:
+    # project_ruby_env). +progress+, a callable returning a note, redraws
+    # the gate's board row every half second while the command runs
+    # (ignored when there is no board).
+    def run_gate(name, label, command, summary:, on_fail: :fail, status: nil, env: project_ruby_env, progress: nil)
+      row = QUALITY_BOARD[:"#{name}_check"]
+      output, exit_status = capture_gate(command, env, row && progress, row)
+      output = output.gsub(/\e\[[\d;]*m/, "")
+      result = exit_status.success? ? status&.call(output) || :pass : on_fail
+      report_gate(name, label, output, result, summary)
+    end
+
+    # Runs +command+ and returns [output, status]. With +progress+, the
+    # output is read on its own thread while +row+'s note is redrawn. The
+    # row has no spin thread (see quality_board), so spin right after the
+    # update: update clears the line, and spin rewrites it at once.
+    def capture_gate(command, env, progress, row, interval: 0.5)
+      return Open3.capture2e(env, command) unless progress
+
+      Open3.popen2e(env, command) do |stdin, out, wait|
+        stdin.close
+        reader = Thread.new { out.read }
+        until wait.join(interval)
+          row.update(note: fit_note(progress.call, row.message))
+          row.spin
+        end
+        [reader.value, wait.value]
+      end
+    end
+
+    # Writes +output+ to <name>_output.txt, reports the gate's one-line
+    # summary and returns +result+.
+    def report_gate(name, label, output, result, summary)
+      file = "#{name}_output.txt"
+      File.write(file, output)
+      finish_gate(name, label, result, "#{gate_summary(output, result, summary)} (see #{file})")
+    end
+
+    # Settles gate +name+ (:rubocop for rubocop_check): its row on the live
+    # board gets the badge and +note+, or, with no board, prints
+    # "Label: note". Returns +result+.
+    def finish_gate(name, label, result, note)
+      row = QUALITY_BOARD[:"#{name}_check"]
+      if row
+        row.update(badge: status_badge(result), note: fit_note(note, row.message))
+        row.success
+      else
+        puts "#{label}: #{note}"
+      end
+      result
+    end
+
+    # Settles gate +name+ as :skip with "SKIPPED — reason".
+    def skip_gate(name, label, reason) = finish_gate(name, label, :skip, "SKIPPED — #{reason}")
+
+    # Pure: skip reasons shared by several gates.
+    def not_bundled_hint(gem_name)
+      "#{gem_name} is not in this repo's bundle. Add it to the Gemfile's development group to enable this gate."
+    end
+
+    def in_process_gem_hint(gem_name)
+      "#{gem_name} can not be loaded by asgard (not installed for asgard's Ruby, or not in the bundle " \
+        "under `bundle exec`). Install it with `gem install #{gem_name}`."
+    end
+
+    # Pure: the <gate>_output.txt body GateGuard writes for a gate that raised.
+    def gate_crash_text(label, error)
+      <<~TEXT
+        #{label}: the gate could not run, so it is reported as #{GATE_CRASH_STATUS.to_s.upcase}.
+
+        #{error.class}: #{error.message}
+
+        Backtrace:
+        #{Array(error.backtrace).map { |line| "  #{line}" }.join("\n")}
+      TEXT
+    end
+
+    # +note+ cut to fit on one terminal line after +pattern+'s visible text.
+    # A wrapped row would throw off the board's cursor moves.
+    def fit_note(note, pattern, columns = $stdout.winsize[1].nonzero? || 80)
+      room = columns - pattern.sub(":spinner:badge", "PASS").sub(":note", "").length - 1
+      note.length <= room ? note : "#{note[0, [room - 1, 0].max]}…"
+    end
+
+    # The colored badge text for a status, e.g. PASS in green.
+    def status_badge(status)
+      text, code = STATUS_BADGES.fetch(status)
+      colorize(code, text)
+    end
+
+    def colorize(code, text) = "\e[#{code}m#{text}\e[0m"
+
+    # The summary for a gate's output. +summary+ is a Regexp, matched against
+    # the last line that fits (the result's name when none does), or a
+    # callable given the output and the result.
+    def gate_summary(output, result, summary)
+      return summary.call(output, result) if summary.respond_to?(:call)
+
+      output.lines.reverse.find { |l| l.match?(summary) }&.strip || result.to_s
     end
 
     # Reek configuration from the nearest .reek.yml at or above +start_dir+:
@@ -430,45 +688,7 @@ class Tasks
     end
 
     def skip_typos
-      puts "Typos: SKIPPED — `typos` command not found. Install it with `brew install typos-cli`."
-      :skip
-    end
-
-    def skip_erb_lint
-      puts "ERBLint: SKIPPED — no .erb files found."
-      :skip
-    end
-
-    def skip_erb_lint_gem
-      puts "ERBLint: SKIPPED — erb_lint is not in this repo's bundle. " \
-        "Add it to the Gemfile's development group to enable this gate."
-      :skip
-    end
-
-    def skip_bundler_audit
-      puts "Bundler Audit: SKIPPED — bundler-audit not found in the bundle or on PATH. " \
-        "Install it with `gem install bundler-audit`."
-      :skip
-    end
-
-    def skip_bundler_audit_lockfile
-      puts "Bundler Audit: SKIPPED — no #{bundle_lockfile} found."
-      :skip
-    end
-
-    def skip_flog
-      puts "Flog: SKIPPED — flog not found in the bundle or on PATH. Install it with `gem install flog`."
-      :skip
-    end
-
-    def skip_flay
-      puts "Flay: SKIPPED — flay can not be loaded by asgard (not installed for asgard's Ruby, or not in the bundle under `bundle exec`). Install it with `gem install flay`."
-      :skip
-    end
-
-    def skip_reek
-      puts "Reek: SKIPPED — reek can not be loaded by asgard (not installed for asgard's Ruby, or not in the bundle under `bundle exec`). Install it with `gem install reek`."
-      :skip
+      skip_gate(:typos, "Typos", "`typos` command not found. Install it with `brew install typos-cli`.")
     end
 
     # Minitest files under test/, in either naming convention. Given a
@@ -480,17 +700,6 @@ class Tasks
         .uniq.sort
     end
 
-    def skip_scrap_tests
-      puts "SCRAP: SKIPPED — no Minitest files (test/**/*_test.rb or test/**/test_*.rb) found."
-      :skip
-    end
-
-    def skip_scrap
-      puts "SCRAP: SKIPPED — scrap4rb not found in the bundle or on PATH. " \
-        "Install it with `gem install scrap4rb`."
-      :skip
-    end
-
     # scrap4rb exits 0 even when it has advice, so read its totals instead.
     # Advisory like Fasterer: any non-STABLE file or structure error is a
     # :warn, never a :fail.
@@ -500,22 +709,6 @@ class Tasks
       modes  = output[/^modes:\s+(.*)$/, 1].to_s.split.map { |pair| pair.split("=").first }
       errors = output[/(\d+) structure errors?/, 1].to_i
       modes.all?("STABLE") && errors.zero? ? :pass : :warn
-    end
-
-    def skip_archspec
-      if command_available?("archspec")
-        puts "ArchSpec: SKIPPED — no Archspec.rb found. Run `archspec init` to generate one."
-      else
-        puts "ArchSpec: SKIPPED — `archspec` command not found. Install it with `gem install archspec` " \
-          "and run `archspec init` to generate an Archspec.rb."
-      end
-      :skip
-    end
-
-    def skip_fasterer
-      puts "Fasterer: SKIPPED — fasterer is not in this repo's bundle. " \
-        "Add it to the Gemfile's development group to enable this gate."
-      :skip
     end
 
     # Status badges. Only :fail is blocking (aborts the quality task);
@@ -538,29 +731,37 @@ class Tasks
       :fail
     end
 
+    def print_quality_header
+      puts <<~HEADER
+
+        #{"=" * 60}
+        Quality Gate Summary
+        #{"=" * 60}
+      HEADER
+    end
+
     # Colorized status badges plus a pass/fail/warn/skip tally; aborts only
     # if any gate failed — skip and warn are informational, not blocking.
-    def print_quality_summary(results)
-      colorize_badge = ->(code, text) { "\e[#{code}m#{text}\e[0m" }
-      width = results.keys.map(&:length).max
-
-      puts "\n#{"=" * 60}"
-      puts "Quality Gate Summary"
-      puts "=" * 60
-      results.each do |label, status|
-        text, code = STATUS_BADGES.fetch(status)
-        puts "  [#{colorize_badge.call(code, text)}] #{label.ljust(width)}"
+    # +rows+ is false when the live board already showed the header and a
+    # row per gate.
+    def print_quality_summary(results, rows: true)
+      if rows
+        print_quality_header
+        width = results.keys.map(&:length).max
+        results.each { |label, status| puts "  [#{status_badge(status)}] #{label.ljust(width)}" }
       end
-      puts "-" * 60
 
       counts = results.values.tally
       failed = counts[:fail] || 0
       tally  = STATUS_BADGES.keys.filter_map { |s| "#{counts[s]} #{s}" if counts[s]&.positive? }.join(", ")
-      puts "  #{colorize_badge.call(failed.zero? ? 32 : 31, tally)}"
-      puts "=" * 60
+      puts <<~FOOTER
+        #{"-" * 60}
+          #{colorize(failed.zero? ? 32 : 31, tally)}
+        #{"=" * 60}
+      FOOTER
 
-      abort "\n#{colorize_badge.call(31, "Quality gate failed.")}" unless failed.zero?
-      puts "\n#{colorize_badge.call(32, "All quality gates passed.")}"
+      abort "\n#{colorize(31, "Quality gate failed.")}" unless failed.zero?
+      puts "\n#{colorize(32, "All quality gates passed.")}"
     end
   end
 end

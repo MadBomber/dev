@@ -8,11 +8,28 @@
 # reads the week's daily files and asks headless Claude Code (`claude -p`)
 # to turn them into a client-facing Markdown report.
 #
+# `shell_hourly` summarizes the clock hour that just ended (again with
+# `claude -p`) into notes/_status/shell/<date>/<HH>00-<HH+1>00.md, and
+# `daily_summary` embeds those summaries in place of the raw command list
+# when the day has any. It is meant to be scheduled, e.g. for a 09:00-17:00
+# day, in the project's .loki:
+#   schedule :shell_hourly, at: %w[10:00 11:00 12:00 13:00 14:00 15:00 16:00 17:00], on: :weekdays
+# A specific hour: STATUS_DATE=2026-09-29 STATUS_HOUR=14 asgard shell_hourly
+#
+# git_collect and github_collect cover RR and every repo listed in
+# STATUS_REPO_DIRS (":"-separated; relative paths resolve against RR).
+#
 # A day other than today: STATUS_DATE=2026-09-22 asgard daily_summary
 # (collector tasks can't take arguments as asgard dependencies, so the date
 # travels via env var instead of a --date option).
 # A week other than the current one (any day in that week; it snaps back
 # to Monday): STATUS_WEEK_OF=2026-09-22 asgard weekly_report
+
+# A scheduled run (launchd) has no LANG, so Ruby defaults to US-ASCII and
+# shell history or `claude` output can't be mixed with the UTF-8 literals
+# below.
+Encoding.default_external = Encoding::UTF_8
+Encoding.default_internal = Encoding::UTF_8
 
 require "date"
 require "fileutils"
@@ -25,6 +42,25 @@ class Tasks
 
   no_commands do
     def status_repo_root = ENV.fetch("RR", Dir.pwd)
+
+    # The git repos git_collect and github_collect cover: the repo root,
+    # then each directory in STATUS_REPO_DIRS (separated by ":", relative
+    # ones resolved against the root), for a project whose work is spread
+    # over several clones. Directories that are not a git work tree are
+    # dropped, and one reached by two paths is listed once.
+    def status_repo_dirs(root = status_repo_root, extra = ENV.fetch("STATUS_REPO_DIRS", ""))
+      [root, *extra.split(File::PATH_SEPARATOR).reject(&:empty?).map { File.expand_path(it, root) }]
+        .select { File.exist?(File.join(it, ".git")) }
+        .uniq { File.realpath(it) }
+    end
+
+    # Pure: per-repo Markdown bodies as one section. A single repo's body
+    # stands alone; several are each headed by their repo's name.
+    def status_repo_sections(bodies)
+      return bodies.values.first if bodies.size == 1
+
+      bodies.map { |name, body| "**#{name}**\n#{body}" }.join("\n\n")
+    end
 
     def status_target_date = status_env_date("STATUS_DATE", "daily_summary")
 
@@ -77,6 +113,99 @@ class Tasks
     def skip(name, reason)
       puts "#{name}: SKIP (#{reason})"
       nil
+    end
+
+    # Bash `history | fgrep DATE`, run in a fresh bash that loads
+    # ~/.bash_history with a timestamp format. Reading the file directly
+    # does not work: bash stores each timestamp as a "#<epoch>" line above
+    # its command, never as a date on the command's own line. Entries saved
+    # without a timestamp are all stamped with the load time, so the load
+    # window is bracketed with MARK lines and stripped by
+    # shell_history_commands.
+    def shell_history_raw(date)
+      script = <<~'BASH'
+        HISTFILE="$HOME/.bash_history"
+        HISTTIMEFORMAT="%F %T "
+        echo "MARK $(date '+%F %T')"
+        history -r
+        echo "MARK $(date '+%F %T')"
+        history | fgrep "$1" || true
+      BASH
+      safe_capture2("bash", "-c", script, "bash", date.to_s)
+    end
+
+    SHELL_SECRET_PATTERN = /(_KEY|_TOKEN|_SECRET|PASSWORD)\s*=/i
+    SHELL_NOISY_COMMANDS = %w[cd ls ll clear pwd history].freeze
+
+    # Pure: shell_history_raw output as "- `HH:MM:SS` `command`" lines for
+    # +date+, without the load-window (untimestamped) entries, secret-looking
+    # lines and bare navigation commands. +hour+ (0-23) keeps only commands
+    # typed during that clock hour.
+    def shell_history_commands(raw, date, hour: nil)
+      raw = raw.dup.force_encoding(Encoding::UTF_8).scrub
+      marks = raw.scan(/^MARK (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})$/).flatten
+      load_from, load_to = marks.first, marks.last
+
+      raw.lines(chomp: true).filter_map do |l|
+        m = l.match(/\A\s*\d+\s+(#{Regexp.escape(date.to_s)} \d{2}:\d{2}:\d{2})\s+(.*)\z/) or next
+        stamp, cmd = m[1], m[2].strip
+        next if cmd.empty? || SHELL_NOISY_COMMANDS.include?(cmd) || SHELL_SECRET_PATTERN.match?(cmd)
+        next if load_from && stamp >= load_from && stamp <= load_to
+        next if hour && stamp[11, 2].to_i != hour
+
+        "- `#{stamp[11..]}` `#{cmd}`"
+      end
+    end
+
+    # [date, hour] of the clock hour shell_hourly summarizes. With neither
+    # variable set it is the hour that ended before +now+, on the day that
+    # hour belongs to (so a run just after midnight covers 23:00 of the day
+    # before). STATUS_DATE and STATUS_HOUR each override their half.
+    def shell_summary_slot(now = Time.now, date: ENV.fetch("STATUS_DATE", nil), hour: ENV.fetch("STATUS_HOUR", nil))
+      previous = now - 3600
+      day = date ? status_env_date("STATUS_DATE", "shell_hourly") : previous.to_date
+      return [day, previous.hour] if hour.nil?
+
+      parsed = Integer(hour, 10, exception: false)
+      abort "shell_hourly: STATUS_HOUR must be an hour from 0 to 23 (got #{hour.inspect})" unless (0..23).cover?(parsed)
+      [day, parsed]
+    end
+
+    # Pure: "0900-1000" for the hour starting at 9 ("09:00-10:00" with a ":" separator).
+    def shell_hour_label(hour, separator = "")
+      format("%<a>02d#{separator}00-%<b>02d#{separator}00", a: hour, b: hour + 1)
+    end
+
+    def shell_summary_path(date, hour)
+      File.join(status_dir, "shell", date.to_s, "#{shell_hour_label(hour)}.md")
+    end
+
+    # Pure: the prompt that turns one hour of commands into a summary.
+    def shell_summary_prompt(date, hour, commands)
+      <<~PROMPT
+        Summarize the shell commands below, typed #{shell_hour_label(hour, ":").sub("-", " to ")}
+        on #{date}, in 1-3 plain sentences about what was being worked on. Group related
+        commands, ignore trivial navigation (cd, ls, clear), name projects or tickets you
+        can infer, and quote no secrets. Output only the summary text.
+
+        #{commands.join("\n")}
+      PROMPT
+    end
+
+    # stdout of headless Claude Code (`claude -p`) for +prompt+; aborts,
+    # naming +task+, when claude is missing or fails. ANTHROPIC_API_KEY is
+    # dropped for this child process only: `claude -p` prefers it over the
+    # CLI's own OAuth login, and a stray/expired key elsewhere in the shell
+    # environment must not break the task's auth.
+    def claude_print(prompt, task)
+      stdout, status = begin
+        Open3.capture2({ "ANTHROPIC_API_KEY" => nil }, "claude", "-p", prompt)
+      rescue Errno::ENOENT
+        abort "#{task}: `claude` not found on PATH. Install the Claude CLI (https://docs.claude.com/claude-code) and run `claude /login` once."
+      end
+      abort "#{task}: claude -p failed (exit #{status.exitstatus}) — is `claude` logged in? Try `claude` interactively once, or `claude /login`." unless status.success?
+
+      stdout
     end
 
     # First human-typed message in a Claude Code session transcript,
@@ -143,52 +272,57 @@ class Tasks
     end
   end
 
-  desc "Collect today's git commits authored by you"
+  desc "Collect today's git commits authored by you, on any branch, in every status repo"
   def git_collect
     collect("git") do
-      rr = status_repo_root
-      email, ok = safe_capture2("git", "-C", rr, "config", "user.email")
-      email = email.strip
-      next skip("git", "no git user.email configured") unless ok && !email.empty?
-
       since, until_ts = status_day_bounds
-      log, ok = safe_capture2("git", "-C", rr, "log", "--author=#{email}",
-                               "--since=#{since}", "--until=#{until_ts}",
-                               "--pretty=format:- %h %s")
-      next skip("git", "git log failed") unless ok
-      next skip("git", "no commits for #{status_target_date}") if log.strip.empty?
+      bodies = status_repo_dirs.each_with_object({}) do |dir, found|
+        email, ok = safe_capture2("git", "-C", dir, "config", "user.email")
+        email = email.strip
+        next unless ok && !email.empty?
 
-      puts "git: #{log.lines.size} commit(s)"
-      log.strip
+        # --all: work on a branch that is not checked out still counts.
+        log, ok = safe_capture2("git", "-C", dir, "log", "--all", "--author=#{email}",
+                                 "--since=#{since}", "--until=#{until_ts}",
+                                 "--pretty=format:- %h %s")
+        found[File.basename(File.realpath(dir))] = log.strip if ok && !log.strip.empty?
+      end
+      next skip("git", "no commits for #{status_target_date}") if bodies.empty?
+
+      puts "git: #{bodies.values.sum { it.lines.size }} commit(s) in #{bodies.size} repo(s)"
+      status_repo_sections(bodies)
     end
   end
 
-  desc "Collect today's GitHub PR/issue activity you were involved in"
+  desc "Collect today's GitHub PR/issue activity you were involved in, in every status repo"
   def github_collect
     collect("github") do
-      nwo, ok = safe_capture2("gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner",
-                               chdir: status_repo_root)
-      nwo = nwo.strip
-      next skip("github", "gh not available or not a GitHub repo") unless ok && !nwo.empty?
+      repos = status_repo_dirs.filter_map do |dir|
+        nwo, ok = safe_capture2("gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner", chdir: dir)
+        nwo.strip if ok && !nwo.strip.empty?
+      end.uniq
+      next skip("github", "gh not available or not a GitHub repo") if repos.empty?
 
       date = status_target_date.to_s
-      items = { "prs" => "PR", "issues" => "Issue" }.flat_map do |kind, label|
-        out, ok = safe_capture2("gh", "search", kind, "--repo", nwo, "--involves=@me",
-                                 "--updated=#{date}", "--json", "number,title,state", "--limit", "50")
-        next [] unless ok
+      bodies = repos.each_with_object({}) do |nwo, found|
+        items = { "prs" => "PR", "issues" => "Issue" }.flat_map do |kind, label|
+          out, ok = safe_capture2("gh", "search", kind, "--repo", nwo, "--involves=@me",
+                                   "--updated=#{date}", "--json", "number,title,state", "--limit", "50")
+          next [] unless ok
 
-        parsed = begin
-          JSON.parse(out)
-        rescue JSON::ParserError
-          []
+          parsed = begin
+            JSON.parse(out)
+          rescue JSON::ParserError
+            []
+          end
+          parsed.map { |item| "- #{label} ##{item["number"]}: #{item["title"]} (#{item["state"]})" }
         end
-        parsed.map { |item| "- #{label} ##{item["number"]}: #{item["title"]} (#{item["state"]})" }
+        found[nwo] = items.join("\n") unless items.empty?
       end
+      next skip("github", "no PR/issue activity for #{date}") if bodies.empty?
 
-      next skip("github", "no PR/issue activity for #{date}") if items.empty?
-
-      puts "github: #{items.size} item(s)"
-      items.join("\n")
+      puts "github: #{bodies.values.sum { it.lines.size }} item(s) in #{bodies.size} repo(s)"
+      status_repo_sections(bodies)
     end
   end
 
@@ -246,29 +380,23 @@ class Tasks
     end
   end
 
-  desc "Collect today's shell commands (requires HISTTIMEFORMAT)"
+  desc "Collect the target date's shell commands (hourly summaries if present, else bash history)"
   def shell_history_collect
     collect("shell_history") do
-      path = File.join(Dir.home, ".bash_history")
-      next skip("shell_history", "no #{path}") unless File.exist?(path)
+      date = status_target_date
+      hourly = Dir.glob(File.join(status_dir, "shell", date.to_s, "*.md")).sort
+      if hourly.any?
+        puts "shell_history: #{hourly.size} hourly summary(ies)"
+        next hourly.map { |f| File.read(f).strip }.join("\n\n")
+      end
 
-      date = status_target_date.to_s
-      secret_pattern = /(_KEY|_TOKEN|_SECRET|PASSWORD)\s*=/i
-      noisy = %w[cd ls ll clear pwd history]
+      out, ok = shell_history_raw(date)
+      next skip("shell_history", "could not run bash history") unless ok
 
-      lines = File.readlines(path, chomp: true)
-                  .select { |l| l.start_with?(date) }
-                  .reject { |l| secret_pattern.match?(l) }
-                  .filter_map do |l|
-                    cmd = l.sub(/\A\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s+/, "").strip
-                    next nil if cmd.empty? || noisy.include?(cmd)
+      lines = shell_history_commands(out, date)
+      next skip("shell_history", "no commands for #{date} in ~/.bash_history") if lines.empty?
 
-                    "- `#{cmd}`"
-                  end
-
-      next skip("shell_history", "no timestamped commands for #{date} (is HISTTIMEFORMAT set?)") if lines.empty?
-
-      puts "shell_history: #{lines.size} command(s)"
+      puts "shell_history: #{lines.size} command(s) (no hourly summaries)"
       lines.join("\n")
     end
   end
@@ -322,6 +450,21 @@ class Tasks
     puts "Wrote #{out_path} (#{sections.size}/#{collect_tasks.size} source(s) had activity)"
   end
 
+  desc "Summarize the previous hour's shell commands into notes/_status/shell/<date>/ via Claude"
+  def shell_hourly
+    date, hour = shell_summary_slot
+    out, ok = shell_history_raw(date)
+    abort "shell_hourly: could not run bash history" unless ok
+
+    commands = shell_history_commands(out, date, hour: hour)
+    summary = commands.empty? ? "_No shell activity._" : claude_print(shell_summary_prompt(date, hour, commands), "shell_hourly").strip
+
+    path = shell_summary_path(date, hour)
+    FileUtils.mkdir_p(File.dirname(path))
+    File.write(path, "### #{shell_hour_label(hour, ":")}\n\n#{summary}\n")
+    puts "Wrote #{path} (#{commands.size} command(s))"
+  end
+
   desc "Assemble the week's daily summaries into a client status report via Claude"
   def weekly_report
     monday = status_week_start(status_env_date("STATUS_WEEK_OF", "weekly_report"))
@@ -349,15 +492,7 @@ class Tasks
       #{raw}
     PROMPT
 
-    # Drop ANTHROPIC_API_KEY for this child process only: `claude -p`
-    # prefers it over the CLI's own OAuth login, and a stray/expired key
-    # elsewhere in the shell environment must not break this task's auth.
-    stdout, status = begin
-      Open3.capture2({ "ANTHROPIC_API_KEY" => nil }, "claude", "-p", prompt)
-    rescue Errno::ENOENT
-      abort "weekly_report: `claude` not found on PATH. Install the Claude CLI (https://docs.claude.com/claude-code) and run `claude /login` once."
-    end
-    abort "weekly_report: claude -p failed (exit #{status.exitstatus}) — is `claude` logged in? Try `claude` interactively once, or `claude /login`." unless status.success?
+    stdout = claude_print(prompt, "weekly_report")
 
     out_path = File.join(status_dir, "week-of-#{monday}.md")
     File.write(out_path, stdout)
