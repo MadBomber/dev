@@ -53,6 +53,7 @@ whose `push` also pushes tags).
   | `claude` | `weekly_report` | Claude Code CLI, then `claude /login` once |
   | `icalBuddy` | `calendar_collect` | `brew install ical-buddy` |
   | `tbls`, `pg_isready` | `db_doc*` tasks | `brew install k1LoW/tap/tbls`; PostgreSQL client tools |
+  | `docker` | `fake_aws` tasks | Docker Desktop, or any Docker engine |
   | `mkdocs` | `doc` tasks in a MkDocs repo | `asgard doc install` (Homebrew) |
   | `typos` | `typos_check`, `typos_fix` | `brew install typos-cli` |
   | `archspec` | `archspec_check` (also needs an `Archspec.rb`) | `gem install archspec`, then `archspec init` |
@@ -74,6 +75,7 @@ whose `push` also pushes tags).
 | `iterm_tasks.loki` | Terminal fixes: `half_duplex_screen_fix`, `clear_scroll_back_buffer` |
 | `branch_report.loki` | `branch_report [DAYS]`: read-only table of every local and remote branch (ahead/behind and merged measured against `origin/<default>` as of the last fetch, else the local default), then the ones idle (or merged and idle) over DAYS, default 30 |
 | `db_doc.loki` | [tbls](https://github.com/k1LoW/tbls) schema docs into `notes/dbdoc` (needs Postgres up on localhost:5432; `DB_DOC_DSN` overrides the default vbr_development DSN): `db_doc`, `db_doc_diff`, `db_doc_mermaid`, `db_doc_open`, `db_doc_clean` |
+| `fake_aws.loki` | AWS's local API emulator in Docker (its Dockerfile and smoke test are in `fake_aws/`): `asgard fake_aws build`, `start`, `stop`, `restart`, `status`, `logs`, `version`, `exports`, `smoke`, `remove` |
 | `rubocop-strict.yml` | Cops kept enabled with no exclusions over `.rubocop_todo.yml` (when inherited after it; see below) |
 
 ### gem_tasks.loki

@@ -1,0 +1,178 @@
+# frozen_string_literal: true
+# fake_aws.loki -- run AWS's local AWS API emulator in Docker and point SDKs at it.
+#
+# Docs: https://docs.aws.amazon.com/emulator/latest/userguide/what-is-service.html
+# Repo: https://github.com/aws/aws-emulator
+#
+# Load it from a project's .loki with:  import "fake_aws.loki"
+# Its Dockerfile and smoke test live in the fake_aws/ directory next to this file.
+#
+#   asgard fake_aws start              build the image if needed, start, wait until healthy
+#   eval "$(asgard fake_aws exports)"  point the AWS CLI / SDKs in this shell at it
+#   asgard fake_aws smoke              S3 + SQS round-trip test with the Ruby SDK
+#   asgard fake_aws stop               stop it (all emulated resources are lost)
+#
+# Each port gets its own container (aws-emulator-<port>), so several can run at once.
+
+require "fileutils"
+
+class FakeAwsCommands < Tasks
+  SUPPORT_DIR = File.join(__dir__, "fake_aws").freeze
+  IMAGE       = "aws-emulator"
+  MEMORY      = "2g"
+
+  class_option :port, aliases: "-p", type: :numeric,
+               default: Integer(ENV.fetch("AWS_EMULATOR_PORT", "9297")),
+               desc: "Emulator port (host and container); env AWS_EMULATOR_PORT"
+
+  desc "build", "Build the emulator image for this machine's CPU"
+  method_option :fresh, type: :boolean, desc: "Ignore the cache and download the latest LTS package"
+  def build
+    flags = options[:fresh] ? "--pull --no-cache " : ""
+    sh "docker build #{flags}--build-arg ARCH=#{rpm_arch} -t #{IMAGE} #{SUPPORT_DIR}"
+  end
+
+  desc "start", "Start the emulator (telemetry off) and wait until it is healthy"
+  method_option :auth, type: :boolean, default: true, desc: "Require SigV4 signing (--no-auth to turn off)"
+  method_option :idle_timeout, type: :numeric, desc: "Stop after N seconds without an API call"
+  def start
+    return say("Already running on port #{port}", :yellow) if running?
+
+    build unless image?
+    FileUtils.mkdir_p(emulator_home)
+    sh docker_run_command(port:, auth: options[:auth], idle_timeout: options[:idle_timeout])
+    wait_until_healthy or abort "Emulator did not become healthy; see `asgard fake_aws logs`"
+    say "AWS Emulator is up at #{endpoint_url}", :green
+    say %(Point this shell at it with:  eval "$(asgard fake_aws exports#{port_flag})")
+  end
+
+  desc "stop", "Stop the emulator; it deletes its credentials and certificate"
+  def stop
+    return say("Not running on port #{port}", :yellow) unless running?
+
+    sh "docker stop #{container}"
+  end
+
+  desc "restart", "Stop, then start with empty state"
+  def restart
+    stop
+    start
+  end
+
+  desc "status", "Show whether the emulator is running and healthy"
+  def status
+    unless running?
+      say "Stopped on port #{port}#{image? ? '' : ' (image not built)'}", :yellow
+      return
+    end
+
+    puts <<~STATUS
+      Running   #{`docker ps --filter name=^#{container}$ --format '{{.Status}}'`.strip}
+      Health    #{healthy? ? 'ok' : 'NOT healthy'}
+      Endpoint  #{endpoint_url}
+      Files     #{port_dir}
+    STATUS
+  end
+
+  desc "logs", "Show the emulator's JSON log"
+  method_option :follow, aliases: "-f", type: :boolean, desc: "Follow the log"
+  def logs = sh "docker logs #{'-f ' if options[:follow]}#{container}", silent: true
+
+  desc "version", "Print the emulator version in the image"
+  def version = sh "docker run --rm #{IMAGE} --version", silent: true
+
+  desc "exports", %(Print shell exports for the AWS CLI/SDKs; use: eval "$(asgard fake_aws exports)")
+  def exports = puts(export_lines(port).join("\n"))
+
+  desc "smoke", "Run the Ruby S3 + SQS smoke test against the running emulator"
+  def smoke
+    abort "Emulator is not running on port #{port}; run `asgard fake_aws start` first" unless running?
+
+    sh <<~SHELL
+      #{export_lines(port).join("\n")}
+      ruby #{File.join(SUPPORT_DIR, 'smoke.rb')}
+    SHELL
+  end
+
+  desc "remove", "Stop the emulator on this port and delete the image"
+  def remove
+    stop if running?
+    sh "docker image rm #{IMAGE}" if image?
+  end
+
+  no_commands do
+    def port = options[:port]
+
+    def port_flag(port = self.port) = port == 9297 ? "" : " -p #{port}"
+
+    def container(port = self.port) = "#{IMAGE}-#{port}"
+
+    def endpoint_url(port = self.port) = "https://127.0.0.1:#{port}"
+
+    def emulator_home = File.join(Dir.home, ".aws", "emulator")
+
+    def port_dir(port = self.port) = File.join(emulator_home, port.to_s)
+
+    # Docker/RPM name for this machine's CPU.
+    def rpm_arch(machine = `uname -m`.strip)
+      { "arm64" => "aarch64", "aarch64" => "aarch64", "x86_64" => "x86_64" }
+        .fetch(machine) { raise "Unsupported CPU architecture: #{machine}" }
+    end
+
+    def image? = system("docker image inspect #{IMAGE} >/dev/null 2>&1")
+
+    def running?(port = self.port) = !`docker ps -q --filter name=^#{container(port)}$`.strip.empty?
+
+    # Same port on both sides: the emulator writes its port into the files it creates.
+    # Published on 127.0.0.1 only so other machines can't reach it.
+    def docker_run_command(port:, auth: true, idle_timeout: nil)
+      emulator_args = ["-p #{port}", "--telemetry off"]
+      emulator_args << "--auth off" unless auth
+      emulator_args << "--idle-timeout #{idle_timeout}" if idle_timeout
+
+      <<~CMD.split.join(" ")
+        docker run -d --rm --name #{container(port)}
+          --memory=#{MEMORY} --memory-swap=#{MEMORY}
+          -p 127.0.0.1:#{port}:#{port}
+          -e HOME=#{Dir.home} -v #{emulator_home}:#{emulator_home}
+          #{IMAGE} #{emulator_args.join(' ')}
+      CMD
+    end
+
+    def healthy?(port = self.port)
+      ca = File.join(port_dir(port), "ca.pem")
+      File.exist?(ca) &&
+        system("curl -sf --cacert #{ca} #{endpoint_url(port)}/__admin/health >/dev/null 2>&1")
+    end
+
+    def wait_until_healthy(port = self.port, tries: 30)
+      tries.times do
+        return true if healthy?(port)
+
+        sleep 1
+      end
+      false
+    end
+
+    # The variables the AWS docs list, plus unsets so real credentials can't leak in.
+    def export_lines(port = self.port)
+      dir = port_dir(port)
+      [
+        "unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE",
+        "export AWS_ENDPOINT_URL=#{endpoint_url(port)}",
+        "export AWS_SHARED_CREDENTIALS_FILE=#{dir}/emulator_credentials",
+        "export AWS_CONFIG_FILE=#{dir}/config",
+        "export AWS_CA_BUNDLE=#{dir}/ca.pem",
+        "export AWS_EC2_METADATA_DISABLED=true",
+        "export AWS_DISABLE_HOST_PREFIX_INJECTION=true",
+        "export AWS_REGION=us-east-1",
+        "export AWS_DEFAULT_REGION=us-east-1"
+      ]
+    end
+  end
+end
+
+class Tasks
+  desc "fake_aws SUBCOMMAND", "Run AWS Emulator locally in Docker (fake AWS APIs)"
+  subcommand "fake_aws", FakeAwsCommands
+end
