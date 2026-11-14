@@ -1,14 +1,14 @@
 # frozen_string_literal: true
 # MadBomber-level quality-gate tasks. Universal across all projects.
-# Import from a project-level loki (e.g. `import "../dev/quality.loki"`), which
+# Import from a project-level loki (e.g. `import_up "dev/quality.loki"`), which
 # component .loki files then reach via `import_up "repo_dev.loki"`.
 #
 # Mirrors asgard's own quality.loki (the golden pattern): every `quality`
 # gate is a `*_check` task; `quality` discovers them dynamically at runtime
 # rather than a fixed list, so a `*_check` task from elsewhere (e.g.
-# quality_rails.loki's brakeman_check, loaded automatically once Rails is
-# defined, or a component's own archspec_check) is picked up too, with no
-# need to redeclare or extend anything.
+# quality_rails.loki's brakeman_check, once a Rails project imports that
+# file (see its header), or a component's own archspec_check) is picked up
+# too, with no need to redeclare or extend anything.
 
 class Tasks
   # Directories the structural gates (flog / flay / reek / fasterer) scan.
@@ -314,7 +314,7 @@ class Tasks
 
   # Curated display labels for the *_check tasks defined in this file. A
   # *_check task from elsewhere (e.g. quality_rails.loki's brakeman_check,
-  # loaded automatically once Rails is defined) isn't listed here — it just
+  # when a Rails project imports that file) isn't listed here — it just
   # falls back to a titleized version of its own name in quality_gate_label.
   QUALITY_GATE_LABELS = {
     "test_check"     => "Tests + Coverage",
@@ -462,12 +462,12 @@ class Tasks
     end
 
     def skip_flay
-      puts "Flay: SKIPPED — flay can not be loaded by asgard (not installed, or outside the active bundle). Install it with `gem install flay`."
+      puts "Flay: SKIPPED — flay can not be loaded by asgard (not installed for asgard's Ruby, or not in the bundle under `bundle exec`). Install it with `gem install flay`."
       :skip
     end
 
     def skip_reek
-      puts "Reek: SKIPPED — reek can not be loaded by asgard (not installed, or outside the active bundle). Install it with `gem install reek`."
+      puts "Reek: SKIPPED — reek can not be loaded by asgard (not installed for asgard's Ruby, or not in the bundle under `bundle exec`). Install it with `gem install reek`."
       :skip
     end
 
@@ -503,9 +503,12 @@ class Tasks
     end
 
     def skip_archspec
-      reason = command_available?("archspec") ? "no Archspec.rb found" : "`archspec` command not found"
-      puts "ArchSpec: SKIPPED — #{reason}. Install it with `gem install archspec` " \
-        "and run `archspec init` to generate one."
+      if command_available?("archspec")
+        puts "ArchSpec: SKIPPED — no Archspec.rb found. Run `archspec init` to generate one."
+      else
+        puts "ArchSpec: SKIPPED — `archspec` command not found. Install it with `gem install archspec` " \
+          "and run `archspec init` to generate an Archspec.rb."
+      end
       :skip
     end
 
