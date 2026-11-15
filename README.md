@@ -120,7 +120,8 @@ dependency. `@@gem_name` defaults to the gemspec's basename (falling back to
 the directory name); a repo may set it earlier if it differs. A `gem_version`
 helper takes the version from the gemspec, falling back to a string `VERSION`
 in `lib/<gem_name>/version.rb` (dashes become slashes), then in the first
-`lib/**/version.rb` that defines it.
+`lib/**/version.rb` that defines it. It imports `quality.loki` itself, since
+`build` runs the gate, so it can be imported alone.
 
 - `build` — runs the `quality` gate, then builds the gemspec into
   `pkg/<name>-<version>.gem`; aborts if no version can be determined
