@@ -36,6 +36,14 @@
 #                                        Jira cannot restore a deleted attachment
 #   asgard ticket create TYPE SUMMARY  — new ticket (--parent, --description, --assign, --open)
 #   asgard ticket pr KEY               — GitHub PRs whose title or branch names the ticket
+#   asgard ticket sync                 — refresh a local mirror of the project's tickets
+#                                        (KEY.json, .md, .html in JIRA_SYNC_DIR) for the
+#                                        ones changed since the last sync; done tickets
+#                                        go to its _done subdirectory (--since, --dry-run)
+#   asgard ticket branch KEY [FROM]    — start a branch named for the ticket (lower-case
+#                                        key); FROM defaults to the parent epic's branch
+#                                        when it exists, else JIRA_BRANCH_BASE. Refuses
+#                                        Done/Canceled tickets unless --force
 #
 # KEY is a full key (PROJ-175, proj-175) or just the number (175), which is
 # prefixed with JIRA_PROJECT.
@@ -51,10 +59,28 @@
 #                      (e.g. customfield_10484), which turns on `ready --acceptor`
 #   JIRA_GITHUB_REPO   optional: OWNER/REPO for `pr` (default: the repo in
 #                      the current directory)
+#   JIRA_SYNC_DIR      optional: the `sync` mirror directory (default
+#                      notes/jira under RR, else the current directory)
+#   JIRA_SYNC_FETCH_COMMAND  optional: run in the mirror directory with the
+#                      changed keys; writes KEY.json and KEY.md
+#                      (default ~/scripts/jira_get.rb)
+#   JIRA_SYNC_RENDER_COMMAND optional: run there with the KEY.md files;
+#                      writes KEY.html (default "~/scripts/md2html -o %{dir}",
+#                      %{dir} being the mirror directory; "" skips it)
+#   JIRA_SYNC_DONE_STATUSES  optional: comma-separated statuses whose
+#                      tickets move to the done subdirectory (default Done)
+#   JIRA_SYNC_DONE_DIR optional: that subdirectory's name (default _done)
+#   JIRA_BRANCH_COMMAND optional: what `branch` runs, with the new branch
+#                      and its source appended (default "git switch -c")
+#   JIRA_BRANCH_BASE   optional: the source when the ticket has no parent
+#                      epic branch (default main)
+#   JIRA_BRANCHES_DIR  optional: for a project that keeps one clone per
+#                      branch, the directory of clones; the parent epic's
+#                      branch then exists when its clone does
 #
 # Two backends. jira-cli (ankitpokhrel/jira-cli, `brew install jira-cli`,
 # configured by `jira init`) does show, mine, search, ffind, children, move,
-# comment, comments, link and create. The REST API v3 does what jira-cli
+# comment, comments, link, create, sync and branch. The REST API v3 does what jira-cli
 # cannot:
 #   * transitions — jira-cli cannot list them, and `move` needs the list for
 #     partial matching (jira-cli's own move wants the exact transition name)
@@ -73,6 +99,7 @@
 # The browser tasks call macOS `open`.
 
 require "base64"
+require "fileutils"
 require "json"
 require "net/http"
 require "open3"
@@ -876,9 +903,184 @@ class TicketCommands < Tasks
   rescue Errno::ENOENT
     abort "gh is not installed."
   end
+
+  # ---- sync: keep a local mirror of the project's tickets current ------------
+  #
+  # The mirror directory holds <KEY>.json / .md / .html per ticket, written by
+  # the fetch and render commands; tickets in a done status live in its done
+  # subdirectory. .sync_datetime holds the ISO 8601 time the last successful
+  # sync started.
+
+  @@sync_overlap_minutes = 1
+
+  helper(:jira_sync_dir) { ENV.fetch("JIRA_SYNC_DIR") { File.join(ENV.fetch("RR", Dir.pwd), "notes", "jira") } }
+  helper(:jira_sync_stamp_path) { |dir| File.join(dir, ".sync_datetime") }
+
+  # Pure: the status names that send a ticket to the done subdirectory.
+  helper(:jira_sync_done_statuses) do |value = ENV.fetch("JIRA_SYNC_DONE_STATUSES", "Done")|
+    value.split(",").map(&:strip).reject(&:empty?)
+  end
+
+  # Pure: argv of a sync command: +template+ split as a shell would, a
+  # leading ~ expanded, %{dir} replaced by the mirror directory, then
+  # +args+. nil for a blank template (that step is switched off).
+  helper(:jira_sync_argv) do |template, dir, args|
+    words = Shellwords.split(template.to_s).map { it.gsub("%{dir}", dir) }
+    next nil if words.empty?
+
+    words.first.start_with?("~") ? [File.expand_path(words.first), *words.drop(1), *args] : [*words, *args]
+  end
+
+  # The last sync time from .sync_datetime, or nil when the file is absent.
+  helper(:jira_sync_last) do |path|
+    next nil unless File.file?(path)
+
+    Time.iso8601(File.read(path).strip)
+  rescue ArgumentError
+    abort "#{path} does not hold an ISO 8601 time (e.g. #{Time.now.iso8601}); fix it or pass --since."
+  end
+
+  # JQL for "updated since `last`", as a relative window ("-90m") so the
+  # machine's clock zone and the Jira profile's zone cannot disagree. Rounded
+  # up, plus an overlap, because JQL times stop at the minute.
+  helper(:jira_sync_jql) do |last, now = Time.now|
+    minutes = ((now - last) / 60.0).ceil + @@sync_overlap_minutes
+    %(updated >= "-#{[minutes, 1].max}m")
+  end
+
+  # Where a ticket's files belong: [home, other] directories. Pure.
+  helper(:jira_sync_homes) do |dir, status, done_statuses = jira_sync_done_statuses, done_name = ENV.fetch("JIRA_SYNC_DONE_DIR", "_done")|
+    done = File.join(dir, done_name)
+    done_statuses.include?(status) ? [done, dir] : [dir, done]
+  end
+
+  # Files to move into `home` and stale copies to delete from `other`, for a
+  # ticket freshly written to `dir`. Pure: decides from the listed names only.
+  # Returns [[from, to], ...], [path, ...].
+  helper(:jira_sync_placement) do |dir, key, homes, names_in_dir, names_in_other|
+    home, other = homes
+    mine = ->(names) { names.select { it.match?(/\A#{Regexp.escape(key)}\.(json|md|html)\z/) } }
+    moves = home == dir ? [] : mine.(names_in_dir).map { [File.join(dir, it), File.join(home, it)] }
+    stale = mine.(names_in_other).map { File.join(other, it) }
+    stale = [] if other == dir # files in dir are the fresh ones
+    [moves, stale]
+  end
+
+  # Runs one sync step inside `dir`; aborts (leaving .sync_datetime alone,
+  # so the next run retries) when the command is missing or fails.
+  helper(:jira_sync_run) do |dir, argv, variable|
+    abort "sync: #{argv.first} not found or not executable (set #{variable})." unless
+      File.executable?(argv.first) || system("which", argv.first, out: File::NULL, err: File::NULL)
+
+    system(*argv, chdir: dir) || abort("sync: #{File.basename(argv.first)} failed (exit #{$?.exitstatus}); .sync_datetime not advanced.")
+  end
+
+  desc "sync", "Refresh the local ticket mirror (JIRA_SYNC_DIR) for tickets changed since its .sync_datetime"
+  long_desc <<~TEXT
+    Finds the project's tickets updated since the time in .sync_datetime in
+    the mirror directory (JIRA_SYNC_DIR, default notes/jira), then runs, inside
+    that directory:
+
+    1. the fetch command with the changed keys (JIRA_SYNC_FETCH_COMMAND,
+       default ~/scripts/jira_get.rb), which writes KEY.json and KEY.md;
+
+    2. the render command with the KEY.md files (JIRA_SYNC_RENDER_COMMAND,
+       default "~/scripts/md2html -o %{dir}"), which writes KEY.html. Set it
+       to an empty string to skip rendering.
+
+    Each ticket's files then go where its status puts them: a status in
+    JIRA_SYNC_DONE_STATUSES (default Done) into the JIRA_SYNC_DONE_DIR
+    subdirectory (default _done), any other in the mirror directory, with an
+    older copy in the other place removed (so a reopened ticket comes back
+    out).
+
+    .sync_datetime is advanced to this run's start time only after every
+    step succeeds. A project schedules it from its own .loki, e.g.
+    schedule :ticket, options: "sync", as: "ticket_sync", at: %w[09:15 13:15 17:00]
+  TEXT
+  method_option :since, type: :string, desc: "Sync changes since this ISO 8601 time instead of .sync_datetime"
+  method_option :dry_run, type: :boolean, default: false, desc: "List the changed tickets; fetch and move nothing"
+  def sync
+    dir = jira_sync_dir
+    abort "#{dir} does not exist (JIRA_SYNC_DIR names the mirror directory)." unless File.directory?(dir)
+    stamp = jira_sync_stamp_path(dir)
+    started = Time.now
+    last = options[:since] ? Time.iso8601(options[:since]) : jira_sync_last(stamp)
+    abort "No #{stamp}; run once with --since (e.g. --since #{(started - 3600).iso8601})." unless last
+
+    changed = jira_ffind_fetch([], jql: jira_sync_jql(last, started))
+    puts "#{started.strftime("%F %T")} sync: #{changed.size} ticket(s) changed since #{last.strftime("%F %T")}" \
+         "#{": #{changed.map { it["key"] }.join(" ")}" unless changed.empty?}"
+    return if options[:dry_run]
+
+    unless changed.empty?
+      keys   = changed.map { it["key"] }
+      fetch  = jira_sync_argv(ENV.fetch("JIRA_SYNC_FETCH_COMMAND", "~/scripts/jira_get.rb"), dir, keys) ||
+               abort("sync: JIRA_SYNC_FETCH_COMMAND is empty; it names the command that writes KEY.json and KEY.md.")
+      render = jira_sync_argv(ENV.fetch("JIRA_SYNC_RENDER_COMMAND", "~/scripts/md2html -o %{dir}"), dir, keys.map { "#{it}.md" })
+      jira_sync_run(dir, fetch, "JIRA_SYNC_FETCH_COMMAND")
+      jira_sync_run(dir, render, "JIRA_SYNC_RENDER_COMMAND") if render
+
+      changed.each do |issue|
+        status = issue.dig("fields", "status", "name")
+        home, other = homes = jira_sync_homes(dir, status)
+        FileUtils.mkdir_p(home)
+        moves, stale = jira_sync_placement(dir, issue["key"], homes, Dir.children(dir), Dir.exist?(other) ? Dir.children(other) : [])
+        moves.each { |from, to| File.rename(from, to) }
+        stale.each { File.delete(it) }
+        puts "  #{issue["key"]} #{status} -> #{home == dir ? File.basename(dir) : File.basename(home)}" \
+             "#{" (removed #{stale.size} stale)" unless stale.empty?}"
+      end
+    end
+
+    File.write(stamp, "#{started.iso8601}\n")
+  end
+
+  # ---- branch: start work on a ticket ------------------------------------------
+
+  # Whether the branch named +name+ already exists to branch from: a clone
+  # directory under JIRA_BRANCHES_DIR for a project that keeps one clone
+  # per branch, else a local git branch in the current directory.
+  helper(:jira_branch_exists?) do |name, branches_dir = ENV.fetch("JIRA_BRANCHES_DIR", nil)|
+    next File.directory?(File.join(branches_dir, name)) unless branches_dir.to_s.strip.empty?
+
+    system("git", "rev-parse", "--verify", "--quiet", "refs/heads/#{name}", out: File::NULL, err: File::NULL)
+  end
+
+  # Pure: what to branch from: FROM if given, else the parent epic's branch
+  # when it exists, else the base branch.
+  helper(:jira_branch_source) do |from, parent_key, parent_exists, base = ENV.fetch("JIRA_BRANCH_BASE", "main")|
+    next from if from
+    next parent_key.downcase if parent_key && parent_exists
+
+    base
+  end
+
+  # Pure: argv that creates +branch+ from +source+: JIRA_BRANCH_COMMAND with
+  # the two names appended, `git switch -c` by default.
+  helper(:jira_branch_argv) do |branch, source, command = ENV.fetch("JIRA_BRANCH_COMMAND", "git switch -c")|
+    [*Shellwords.split(command), branch, source]
+  end
+
+  desc "branch KEY [FROM]", "Start a branch named for the ticket; FROM defaults to the parent epic's branch, else JIRA_BRANCH_BASE (main)"
+  method_option :force, type: :boolean, default: false, desc: "Branch even though the ticket is Done or Canceled"
+  def branch(ref, from = nil)
+    key = jira_key(ref)
+    fields = jira_cli_issue(key)["fields"]
+    status = fields["status"]
+    if status.dig("statusCategory", "key") == "done" && !options[:force]
+      abort "#{key} is #{status["name"]} — not branching. Use --force to branch anyway."
+    end
+
+    parent = fields.dig("parent", "key")
+    source = jira_branch_source(from, parent, parent && jira_branch_exists?(parent.downcase))
+    argv   = jira_branch_argv(key.downcase, source)
+    puts "Branching #{key.downcase} from #{source}#{" (parent epic #{parent})" if source == parent&.downcase}: #{Shellwords.join(argv)}"
+    system(*argv) || abort("#{Shellwords.join(argv.first(2))} failed.")
+  end
 end
 
 class Tasks
-  desc "ticket SUBCOMMAND", "Jira tickets: open, show, search, ffind, move, comment, history, remaining, link, attach, create, pr"
+  desc "ticket SUBCOMMAND", "Jira tickets: open, show, search, ffind, move, comment, history, remaining, link, attach, create, sync, branch, pr"
   subcommand "ticket", TicketCommands
 end
