@@ -39,23 +39,26 @@ class Tasks
   # task is written to that gate's _output.txt, exception and backtrace, and
   # the gate reports GATE_CRASH_STATUS. That is :fail — a gate that could
   # not run has not passed, and a WARN would let a broken gate through
-  # silently (the same reasoning as quality_check_status). Prepended on
-  # invoke_command, not defined in the class: asgard 0.6.0 refuses a task or
-  # helper of that name. SystemExit and Interrupt pass through: `abort` and
-  # Ctrl-C keep their meaning.
+  # silently (the same reasoning as quality_check_status). Other tasks, and
+  # a mistyped task name (even one ending in _check), raise as usual.
+  # Prepended on invoke_command, not defined in the class: asgard 0.6.0
+  # refuses a task or helper of that name. SystemExit and Interrupt pass
+  # through: `abort` and Ctrl-C keep their meaning.
   GATE_CRASH_STATUS = :fail
 
   module GateGuard
     def invoke_command(command, *)
-      return super unless command.name.end_with?("_check")
+      return super unless self.class.quality_checks.include?(command.name.to_sym)
 
-      super
-    rescue StandardError, ScriptError => e
-      gate   = command.name.delete_suffix("_check")
-      output = "#{gate}_output.txt"
-      File.write(output, gate_crash_text(quality_gate_label(command.name), e))
-      finish_gate(gate.to_sym, quality_gate_label(command.name), GATE_CRASH_STATUS,
-                  "could not run: #{e.class}: #{e.message.lines.first.to_s.strip} (see #{output})")
+      begin
+        super
+      rescue StandardError, ScriptError => e
+        gate   = command.name.delete_suffix("_check")
+        output = "#{gate}_output.txt"
+        File.write(output, gate_crash_text(quality_gate_label(command.name), e))
+        finish_gate(gate.to_sym, quality_gate_label(command.name), GATE_CRASH_STATUS,
+                    "could not run: #{e.class}: #{e.message.lines.first.to_s.strip} (see #{output})")
+      end
     end
   end
   prepend GateGuard
