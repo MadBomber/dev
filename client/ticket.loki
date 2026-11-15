@@ -1008,7 +1008,8 @@ class TicketCommands < Tasks
     last = options[:since] ? Time.iso8601(options[:since]) : jira_sync_last(stamp)
     abort "No #{stamp}; run once with --since (e.g. --since #{(started - 3600).iso8601})." unless last
 
-    changed = jira_ffind_fetch([], jql: jira_sync_jql(last, started))
+    # No cap: the stamp below moves past every change, so each must be fetched.
+    changed = jira_ffind_fetch([], Float::INFINITY, jql: jira_sync_jql(last, started))
     puts "#{started.strftime("%F %T")} sync: #{changed.size} ticket(s) changed since #{last.strftime("%F %T")}" \
          "#{": #{changed.map { it["key"] }.join(" ")}" unless changed.empty?}"
     return if options[:dry_run]
