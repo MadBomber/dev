@@ -246,7 +246,7 @@ class Tasks
   # Markdown body with no top-level header; daily_summary supplies
   # "## <Source>" itself.
 
-  desc "Collect today's _notes.txt journal entries"
+  desc "Collect the target date's _notes.txt journal entries"
   def notes_collect
     collect("notes") do
       path = File.join(status_repo_root, "_notes.txt")
@@ -272,7 +272,7 @@ class Tasks
     end
   end
 
-  desc "Collect today's git commits authored by you, on any branch, in every status repo"
+  desc "Collect the target date's git commits authored by you, on any branch, in every status repo"
   def git_collect
     collect("git") do
       since, until_ts = status_day_bounds
@@ -294,7 +294,7 @@ class Tasks
     end
   end
 
-  desc "Collect today's GitHub PR/issue activity you were involved in, in every status repo"
+  desc "Collect the target date's GitHub PR/issue activity you were involved in, in every status repo"
   def github_collect
     collect("github") do
       repos = status_repo_dirs.filter_map do |dir|
@@ -326,7 +326,7 @@ class Tasks
     end
   end
 
-  desc "Collect today's Jira activity in the project"
+  desc "Collect the target date's Jira activity in the project"
   def jira_collect
     collect("jira") do
       site, project, email, token = ENV.values_at("JIRA_SITE", "JIRA_PROJECT", "JIRA_USER_EMAIL", "JIRA_API_KEY")
@@ -362,7 +362,7 @@ class Tasks
     end
   end
 
-  desc "Collect today's Claude Code session activity for this project"
+  desc "Collect the target date's Claude Code session activity for this project"
   def claude_sessions_collect
     collect("claude_sessions") do
       dir = File.join(Dir.home, ".claude", "projects", status_repo_root.gsub(%r{[/_]}, "-"))
@@ -428,7 +428,7 @@ class Tasks
   desc "Abort unless STATUS_DATE (if set) is a readable date"
   def status_date_guard = status_target_date
 
-  desc "Collect today's activity from every configured source into notes/_status/<date>.md"
+  desc "Collect the target date's activity from every configured source into notes/_status/<date>.md"
   depends_on -> { [:status_date_guard, all_commands.keys.grep(/_collect\z/).sort.map(&:to_sym)] }
   def daily_summary
     date = status_target_date
