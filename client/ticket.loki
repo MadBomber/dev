@@ -98,7 +98,6 @@
 # prints Jira's own errors when it does, and `ready` sets the usual ones.
 # The browser tasks call macOS `open`.
 
-require "base64"
 require "fileutils"
 require "json"
 require "net/http"
