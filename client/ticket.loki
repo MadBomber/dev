@@ -411,8 +411,10 @@ class TicketCommands < Tasks
   end
 
   # Header + rows → markdown table lines, columns padded so the source
-  # also reads aligned.
+  # also reads aligned. "|" in a cell is escaped so free text such as a
+  # title stays in its cell instead of splitting the row.
   helper(:jira_markdown_table) do |header, rows|
+    header, *rows = ([header] + rows).map { |row| row.map { it.to_s.gsub("|", "\\|") } }
     widths = ([header] + rows).transpose.map { |col| col.map(&:length).max }
     line = ->(cells) { "| #{cells.each_with_index.map { |c, i| c.ljust(widths[i]) }.join(" | ")} |" }
     [line.call(header), "|#{widths.map { "-" * (it + 2) }.join("|")}|", *rows.map { line.call(it) }]
