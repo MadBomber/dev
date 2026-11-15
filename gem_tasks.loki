@@ -1,10 +1,15 @@
 # frozen_string_literal: true
 require "fileutils"
 # MadBomber-level gem lifecycle tasks. Universal across all projects.
-# Import from a project-level loki (e.g. `import "../dev/gem_tasks.loki"`).
+# Import from a project-level loki (e.g. `import_up "dev/gem_tasks.loki"`).
 #
 # @@gem_name defaults to the gemspec's basename (falling back to the current
 # directory's basename); a component/project may set it earlier if it differs.
+
+# `build` depends on `quality`, from quality.loki. Unlike a relative import,
+# __FILE__ keeps a symlinked dev/ path the way import_up recorded it, and the
+# guard skips quality.loki already loaded under another path: one load.
+import File.join(File.dirname(__FILE__), "quality.loki") unless Tasks.method_defined?(:bundled_gem?)
 
 class Tasks
   @@gem_name ||= if (gemspec = Dir.glob("*.gemspec").first)
