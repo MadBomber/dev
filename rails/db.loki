@@ -161,9 +161,14 @@ class Tasks
 
   # Replace the local `database` with the dump at `path`, which came from
   # `source`: "LOCAL" for a dump of this server, or a label such as
-  # "STAGING" for one taken elsewhere. opts: backup, jobs, yes, dry_run.
+  # "STAGING" for one taken elsewhere. opts: backup, jobs (default 4), yes,
+  # dry_run.
   helper(:local_restore) do |path, database, source, opts|
     abort "No such file: #{path}" unless File.file?(path)
+    # Checked here, not left to pg_restore: by then the database is dropped.
+    jobs = opts.fetch(:jobs, 4)
+    abort "--jobs must be a whole number of at least 1 (got #{jobs.inspect}); nothing changed." unless
+      jobs.is_a?(Integer) && jobs.positive?
 
     local_restore_guard(database)
     _out, _err, listed = Open3.capture3("pg_restore", "--list", path)
@@ -176,7 +181,7 @@ class Tasks
       Dump      #{path} (#{(File.size(path) / 1_048_576.0).round(1)} MB, #{File.mtime(path).strftime("%Y-%m-%d %H:%M")})
       Target    #{database} on #{LOCAL_DB_HOST}:#{LOCAL_DB_PORT} as #{LOCAL_DB_USER} (LOCAL)#{" (does not exist yet)" unless exists}
       Backup    #{backup ? "#{dump_dir}/#{database}-YYYYMMDD-HHMMSS.dump" : "none"}
-      Steps     drop #{database} (ending its connections, e.g. bin/dev), create it, pg_restore --jobs #{opts[:jobs]}
+      Steps     drop #{database} (ending its connections, e.g. bin/dev), create it, pg_restore --jobs #{jobs}
     PLAN
     next puts("Dry run: nothing changed.") if opts[:dry_run]
     unless opts[:yes]
@@ -190,9 +195,12 @@ class Tasks
     end
     system("dropdb", "--if-exists", "--force", *local_pg_flags, database) || abort("dropdb #{database} failed.")
     system("createdb", *local_pg_flags, database) || abort("createdb #{database} failed.")
-    restored = system("pg_restore", "--no-owner", "--no-privileges", "--jobs", opts[:jobs].to_s,
+    restored = system("pg_restore", "--no-owner", "--no-privileges", "--jobs", jobs.to_s,
                       *local_pg_flags, "-d", database, path)
-    abort "pg_restore reported errors (above); #{database} may be incomplete." unless restored
+    unless restored
+      abort ["pg_restore reported errors (above); #{database} may be incomplete.",
+             (saved && "To put the previous #{database} back: #{local_restore_undo(database, saved)}")].compact.join("\n")
+    end
 
     lines = ["Restored #{database} from #{path}."]
     version, = local_query(database, "select max(version) from schema_migrations")
