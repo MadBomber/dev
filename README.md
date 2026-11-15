@@ -372,8 +372,13 @@ Settings come from the environment:
 | `DB_NAME` | The database | `<app directory>_development`, the app directory being `RR` or the current directory |
 | `DB_HOST`, `DB_PORT` | The server | `localhost`, `5432` |
 | `DB_USER` | The role | `PGUSER`, else your login name |
+| `DB_PASSWORD` | The role's password, passed to the PostgreSQL tools as `PGPASSWORD` | none (`PGPASSWORD` or `~/.pgpass` also work) |
 | `DB_DUMP_DIR` | Where dumps go | `tmp/db-dumps` in the app directory |
 | `DB_TUNNEL_PORTS` | Comma-separated local ports that forward to a remote database | none |
+
+The environment is the only configuration, so a project needs no file of
+its own. One whose root is not the Rails app's directory exports
+`DB_NAME`, since the default name would be taken from the wrong directory.
 
 `restore` refuses to run unless the target is on this machine: the host
 must be `localhost` or a socket directory, the port must not be in
