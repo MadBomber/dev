@@ -122,12 +122,14 @@ helper takes the version from the gemspec, falling back to a string `VERSION`
 in `lib/<gem_name>/version.rb` (dashes become slashes), then in the first
 `lib/**/version.rb` that defines it.
 
-- `build` — builds the gemspec into `pkg/<name>-<version>.gem`; aborts if no
-  version can be determined
+- `build` — runs the `quality` gate, then builds the gemspec into
+  `pkg/<name>-<version>.gem`; aborts if no version can be determined
 - `install` — builds, then `gem install --local`
-- `release` — runs the `quality` gate and `build`, aborts if no version can
-  be determined, confirms (skip with `-y`), requires a clean working tree and an unused `v<version>` tag, then tags,
-  pushes, and `gem push`es to RubyGems
+- `release` — refuses to run on any branch but `main` (set
+  `@@release_branch` earlier for another), before the gate or the build
+  start; then builds, aborts if no version can be determined, confirms
+  (skip with `-y`), requires a clean working tree and an unused
+  `v<version>` tag, then tags, pushes, and `gem push`es to RubyGems
 
 ### quality.loki
 
