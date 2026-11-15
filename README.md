@@ -358,7 +358,8 @@ A discovery layer over a repo's operational runbooks, the Markdown files
 in `docs/runbooks` (`README.md` is left out). `asgard runbook list` prints
 each file's name and its first heading; `asgard runbook show NAME` opens
 the one whose name contains NAME (case-insensitive, `-` and `_` treated
-alike) in `glow` when installed, else `$PAGER`, else `less`. Off a terminal
+alike, a trailing `.md` ignored; an exact name wins) in `glow` when
+installed, else `$PAGER`, else `less`. Off a terminal
 it prints the file instead. Set `RUNBOOKS_DIR` when the runbooks live
 somewhere else.
 
