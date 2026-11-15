@@ -54,6 +54,18 @@ class Tasks
         .uniq { File.realpath(it) }
     end
 
+    # Pure: a section heading for each repo path: its basename, else
+    # parent/basename where basenames repeat, else the full path, so no two
+    # repos share a heading (and one can't overwrite the other's commits).
+    def status_repo_labels(paths)
+      labels = paths.to_h { [it, File.basename(it)] }
+      [->(path) { File.join(File.basename(File.dirname(path)), File.basename(path)) }, :itself.to_proc].each do |longer|
+        repeated = labels.values.tally.select { |_, n| n > 1 }.keys
+        labels.each_key { |path| labels[path] = longer.(path) if repeated.include?(labels[path]) }
+      end
+      labels
+    end
+
     # Pure: per-repo Markdown bodies as one section. A single repo's body
     # stands alone; several are each headed by their repo's name.
     def status_repo_sections(bodies)
@@ -276,7 +288,9 @@ class Tasks
   def git_collect
     collect("git") do
       since, until_ts = status_day_bounds
-      bodies = status_repo_dirs.each_with_object({}) do |dir, found|
+      dirs   = status_repo_dirs
+      labels = status_repo_labels(dirs.map { File.realpath(it) })
+      bodies = dirs.each_with_object({}) do |dir, found|
         email, ok = safe_capture2("git", "-C", dir, "config", "user.email")
         email = email.strip
         next unless ok && !email.empty?
@@ -285,7 +299,7 @@ class Tasks
         log, ok = safe_capture2("git", "-C", dir, "log", "--all", "--author=#{email}",
                                  "--since=#{since}", "--until=#{until_ts}",
                                  "--pretty=format:- %h %s")
-        found[File.basename(File.realpath(dir))] = log.strip if ok && !log.strip.empty?
+        found[labels.fetch(File.realpath(dir))] = log.strip if ok && !log.strip.empty?
       end
       next skip("git", "no commits for #{status_target_date}") if bodies.empty?
 

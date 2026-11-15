@@ -226,7 +226,8 @@ be redeclared.
 `git_collect` and `github_collect` cover the repo at `RR` by default. For a
 project whose work is spread over several clones, list the others in
 `STATUS_REPO_DIRS`, separated by `:` (relative paths are resolved against
-`RR`); each repo then gets its own heading in the day's file:
+`RR`); each repo then gets its own heading in the day's file (its directory
+name, or `parent/name` when two repos share a name):
 
 ```bash
 export STATUS_REPO_DIRS="branches/working:../shared-library"
