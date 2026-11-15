@@ -267,7 +267,7 @@ class Tasks
       body = entries[wanted]&.strip
       next skip("notes", "no entries for #{wanted}") if body.nil? || body.empty?
 
-      puts "notes: found today's journal entry"
+      puts "notes: found the journal entry for #{wanted}"
       body.lines.map { |l| "> #{l}" }.join
     end
   end
@@ -445,7 +445,7 @@ class Tasks
 
     FileUtils.mkdir_p(status_dir)
     out_path = File.join(status_dir, "#{date}.md")
-    body = sections.empty? ? "_No activity captured today._" : sections.join("\n\n")
+    body = sections.empty? ? "_No activity captured for #{date}._" : sections.join("\n\n")
     File.write(out_path, "# #{date}\n\n#{body}\n")
     puts "Wrote #{out_path} (#{sections.size}/#{collect_tasks.size} source(s) had activity)"
   end
