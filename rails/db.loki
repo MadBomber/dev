@@ -28,9 +28,16 @@
 #                    current directory)
 #   DB_HOST, DB_PORT the server (default localhost:5432)
 #   DB_USER          the role (default: PGUSER, else your login name)
+#   DB_PASSWORD      the role's password, when the server asks for one
+#                    (handed to the PostgreSQL tools as PGPASSWORD unless
+#                    that is already set; ~/.pgpass works too)
 #   DB_DUMP_DIR      where dumps go (default: tmp/db-dumps in the app directory)
 #   DB_TUNNEL_PORTS  comma-separated local ports that forward to a REMOTE
 #                    database (an SSH or SSM tunnel); restore refuses them
+#
+# A project whose root is not the Rails app's directory (so the default
+# database name would be wrong) exports DB_NAME; nothing here needs a
+# project file of its own.
 #
 # Dumps are DATABASE-YYYYMMDD-HHMMSS[-schema].dump, mode 600. Keep the dump
 # directory out of git: a dump is a full copy of the data.
@@ -44,6 +51,9 @@
 require "fileutils"
 require "open3"
 require "tempfile"
+
+# The PostgreSQL client tools read PGPASSWORD, Rails apps DB_PASSWORD.
+ENV["PGPASSWORD"] ||= ENV["DB_PASSWORD"] if ENV["DB_PASSWORD"]
 
 class Tasks
   LOCAL_DB_HOST   = ENV.fetch("DB_HOST", "localhost")
@@ -143,9 +153,10 @@ class Tasks
   end
 
   # Pure: the command that undoes a restore of +database+ from the backup
-  # at +saved+. DB_NAME is spelled out unless the database is the default.
-  helper(:local_restore_undo) do |database, saved, default = default_db_name|
-    "#{"DB_NAME=#{database} " unless database == default}asgard db restore #{saved}"
+  # at +saved+. DB_NAME is always spelled out: the database restored may
+  # not be the one DB_NAME names in the shell the command is pasted into.
+  helper(:local_restore_undo) do |database, saved|
+    "DB_NAME=#{database} asgard db restore #{saved}"
   end
 
   # Replace the local `database` with the dump at `path`, which came from

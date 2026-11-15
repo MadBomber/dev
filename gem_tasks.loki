@@ -13,6 +13,10 @@ class Tasks
                    File.basename(Dir.pwd).freeze
                  end
 
+  # The only branch `release` runs on; a component/project may set it earlier
+  # (e.g. @@release_branch = "master").
+  @@release_branch ||= "main".freeze
+
   # The version `gem build` will use: the gemspec's own, so a computed VERSION
   # (e.g. `[0, 1, 0].join(".")`) still names the file right. Falls back to a
   # string literal in lib/<gem_name with - as />/version.rb, then in the first
@@ -51,7 +55,21 @@ class Tasks
     end
   end
 
-  desc "Build gem package"
+  # The checked-out branch, or nil outside a git checkout.
+  helper(:current_branch) do
+    branch = `git rev-parse --abbrev-ref HEAD 2>/dev/null`.strip
+    branch unless branch.empty?
+  end
+
+  # Why a release from +branch+ is refused, or nil when +allowed+ is checked out.
+  helper(:release_branch_error) do |branch, allowed|
+    next if branch == allowed
+
+    "Releases are made from #{allowed} only; this is #{branch || 'not a git checkout'}."
+  end
+
+  desc "Build gem package (runs the quality gate first)"
+  depends_on :quality
   def build
     gemspec = Dir.glob("*.gemspec").first
     abort "No gemspec found in #{Dir.pwd}." unless gemspec
@@ -68,9 +86,16 @@ class Tasks
     sh "gem install pkg/#{@@gem_name}-#{gem_version}.gem --local"
   end
 
-  desc "release", "Release gem to RubyGems (runs quality gate first)"
+  # Hidden (no desc): release runs it first, so a release from any branch but
+  # @@release_branch stops before the quality gate and the build.
+  def main_branch
+    error = release_branch_error(current_branch, @@release_branch)
+    abort error if error
+  end
+
+  desc "release", "Release gem to RubyGems from the release branch (builds behind the quality gate first)"
   option :yes, aliases: "-y", type: :boolean, default: false, desc: "Skip confirmation prompt"
-  depends_on [:quality, :build]
+  depends_on :main_branch, :build
   def release
     version = gem_version
     abort "Cannot determine #{@@gem_name}'s version from its gemspec or lib/**/version.rb — refusing to release." if version.to_s.empty? || version == "?.?.?"

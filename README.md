@@ -102,7 +102,7 @@ whose `push` also pushes tags).
 | `git.loki` | Per-repo git basics: `push`, `pull` (ff-only), `fetch` |
 | `doc_tasks.loki` | Documentation site tasks, for a repo with `mkdocs.yml` or `bridgetown.config.yml`: `doc install`, `doc build`, `doc serve`, `doc open` |
 | `client/status_report.loki` | End-of-week client status reporting: `daily_summary`, `weekly_report`, `shell_hourly` |
-| `client/ticket.loki` | Jira tickets from the command line: `asgard ticket show`, `mine`, `search`, `ffind`, `move`, `comment`, `history`, `ready`, `children`, `remaining`, `link`, `attach`, `detach`, `create`, `pr`, and more |
+| `client/ticket.loki` | Jira tickets from the command line: `asgard ticket show`, `mine`, `search`, `ffind`, `move`, `comment`, `history`, `ready`, `children`, `remaining`, `link`, `attach`, `detach`, `create`, `sync`, `branch`, `pr`, and more |
 | `iterm_tasks.loki` | Terminal fixes: `half_duplex_screen_fix`, `clear_scroll_back_buffer` |
 | `branch_report.loki` | `branch_report [DAYS]`: read-only Markdown report with one row per branch (local and origin copies together), sorted into Active, Stale (idle over DAYS, default 30) and Merged. Uses `gh`, when available, to recognize squash- and rebase-merged PRs |
 | `rails/db.loki` | Local PostgreSQL development database: `asgard db status`, `tables`, `psql`, `backup`, `backups`, `dumps`, `restore`, `diff`, `start`, `stop` |
@@ -122,12 +122,14 @@ helper takes the version from the gemspec, falling back to a string `VERSION`
 in `lib/<gem_name>/version.rb` (dashes become slashes), then in the first
 `lib/**/version.rb` that defines it.
 
-- `build` — builds the gemspec into `pkg/<name>-<version>.gem`; aborts if no
-  version can be determined
+- `build` — runs the `quality` gate, then builds the gemspec into
+  `pkg/<name>-<version>.gem`; aborts if no version can be determined
 - `install` — builds, then `gem install --local`
-- `release` — runs the `quality` gate and `build`, aborts if no version can
-  be determined, confirms (skip with `-y`), requires a clean working tree and an unused `v<version>` tag, then tags,
-  pushes, and `gem push`es to RubyGems
+- `release` — refuses to run on any branch but `main` (set
+  `@@release_branch` earlier for another), before the gate or the build
+  start; then builds, aborts if no version can be determined, confirms
+  (skip with `-y`), requires a clean working tree and an unused
+  `v<version>` tag, then tags, pushes, and `gem push`es to RubyGems
 
 ### quality.loki
 
@@ -259,6 +261,14 @@ full key (`PROJ-175`, `proj-175`) or just its number (`175`), which gets
   `link A VERB B`, `attach KEY FILE...`, `detach KEY [NAME...]`,
   `create TYPE SUMMARY`
 - **GitHub**: `pr KEY` lists the PRs whose title or branch names the ticket
+- **Work**: `branch KEY [FROM]` starts a branch named for the ticket, from
+  the parent epic's branch when there is one, else the base branch; it
+  refuses a Done or Canceled ticket unless `--force`
+- **Mirror**: `sync` keeps a directory of `KEY.json`, `KEY.md` and
+  `KEY.html` files current for the tickets changed since the last sync,
+  with done tickets in a `_done` subdirectory (`--since`, `--dry-run`).
+  It runs two commands of yours: one that fetches tickets by key, one
+  that renders the Markdown as HTML
 
 `detach` deletes attachments, which Jira cannot restore; with no name it
 only lists them.
@@ -276,6 +286,18 @@ It needs [jira-cli](https://github.com/ankitpokhrel/jira-cli) set up with
 | `JIRA_OPEN_COMMAND` | Optional: the browser command `--chrome` runs |
 | `JIRA_ACCEPTOR_FIELD` | Optional: the id of an "Acceptor" user custom field, which turns on `ready --acceptor` |
 | `JIRA_GITHUB_REPO` | Optional: `OWNER/REPO` for `pr`; default is the repo in the current directory |
+| `JIRA_SYNC_DIR` | Optional: the `sync` mirror directory; default `notes/jira` under `RR`, else the current directory |
+| `JIRA_SYNC_FETCH_COMMAND` | Optional: run in the mirror directory with the changed keys, it writes `KEY.json` and `KEY.md`; default `~/scripts/jira_get.rb` |
+| `JIRA_SYNC_RENDER_COMMAND` | Optional: run there with the `KEY.md` files, it writes `KEY.html`; default `~/scripts/md2html -o %{dir}`; an empty string skips rendering |
+| `JIRA_SYNC_DONE_STATUSES` | Optional: comma-separated statuses whose tickets move to the done subdirectory; default `Done` |
+| `JIRA_SYNC_DONE_DIR` | Optional: that subdirectory's name; default `_done` |
+| `JIRA_BRANCH_COMMAND` | Optional: what `branch` runs, with the new branch and its source appended; default `git switch -c` |
+| `JIRA_BRANCH_BASE` | Optional: the source for a ticket with no parent epic branch; default `main` |
+| `JIRA_BRANCHES_DIR` | Optional: for a project with one clone per branch, the directory of clones; the parent epic's branch exists when its clone does |
+
+`sync` is not scheduled here. A project that wants it hourly declares
+`schedule :ticket, options: "sync", as: "ticket_sync", at: %w[09:15 13:15 17:00]`
+in its own `.loki`.
 
 The file's header explains which tasks go through jira-cli and which
 through the REST API, and why.
@@ -370,8 +392,13 @@ Settings come from the environment:
 | `DB_NAME` | The database | `<app directory>_development`, the app directory being `RR` or the current directory |
 | `DB_HOST`, `DB_PORT` | The server | `localhost`, `5432` |
 | `DB_USER` | The role | `PGUSER`, else your login name |
+| `DB_PASSWORD` | The role's password, passed to the PostgreSQL tools as `PGPASSWORD` | none (`PGPASSWORD` or `~/.pgpass` also work) |
 | `DB_DUMP_DIR` | Where dumps go | `tmp/db-dumps` in the app directory |
 | `DB_TUNNEL_PORTS` | Comma-separated local ports that forward to a remote database | none |
+
+The environment is the only configuration, so a project needs no file of
+its own. One whose root is not the Rails app's directory exports
+`DB_NAME`, since the default name would be taken from the wrong directory.
 
 `restore` refuses to run unless the target is on this machine: the host
 must be `localhost` or a socket directory, the port must not be in
