@@ -28,7 +28,7 @@
 - [rails/db.loki](https://github.com/MadBomber/dev/blob/main/rails/db.loki): local PostgreSQL development database under `asgard db`: `status`, `tables`, `psql`, `backup`, `backups`, `dumps`, `restore` (destructive; backs up first, refuses a non-local target), `diff` of two dumps' schemas, `start`, `stop`
 - [rails/db_doc.loki](https://github.com/MadBomber/dev/blob/main/rails/db_doc.loki): tbls schema docs into `notes/dbdoc`: `db_doc`, `db_doc_diff`, `db_doc_mermaid`, `db_doc_open`, `db_doc_clean`
 - [rails/dev.loki](https://github.com/MadBomber/dev/blob/main/rails/dev.loki): background dev stack for a Rails app: `asgard dev up`, `down`, `status` (`bin/dev` plus Mailpit when installed)
-- [runbook.loki](https://github.com/MadBomber/dev/blob/main/runbook.loki): `asgard runbook list` and `asgard runbook show NAME` over the Markdown files in `docs/runbooks`
+- [runbook.loki](https://github.com/MadBomber/dev/blob/main/runbook.loki): `asgard runbook list` and `asgard runbook show NAME` (partial name; an exact name wins) over the Markdown files in `docs/runbooks`
 - [aws.loki](https://github.com/MadBomber/dev/blob/main/aws.loki): AWS SSO under `asgard aws`: `login`, `logout`, `whoami`, `profiles`, `portal`; a project reopens `AwsCommands` to add its own AWS tasks
 - [fake_aws.loki](https://github.com/MadBomber/dev/blob/main/fake_aws.loki): AWS's local API emulator in Docker, as `fake_aws` subcommands: `build`, `start`, `stop`, `restart`, `status`, `logs`, `version`, `exports`, `smoke`, `remove`
 
