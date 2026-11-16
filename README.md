@@ -167,7 +167,8 @@ RSpec runs set `COVERAGE=true`. The parallel run uses
 `PARALLEL_TEST_PROCESSORS` processes (default: CPU count, at most 8, never
 more than there are spec files) and, on the live board, shows a progress
 bar fed by `quality/test_progress_listener.rb`, which is loaded through
-`SPEC_OPTS` so the app carries no code for it. A Rails app needs its
+`SPEC_OPTS` (appended to any `SPEC_OPTS` you set) so the app carries no
+code for it. A Rails app needs its
 per-process test databases first: `bin/rails parallel:prepare`.
 
 **A gate that raises is a FAIL, not a crash.** An exception out of any

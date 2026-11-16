@@ -409,8 +409,9 @@ class Tasks
       FileUtils.rm_rf(progress_dir)
       FileUtils.mkdir_p(progress_dir)
       processes = parallel_test_processes
+      spec_opts = [ENV["SPEC_OPTS"], "--require #{TEST_PROGRESS_LISTENER.shellescape}"].compact.join(" ")
       env = project_ruby_env.merge("COVERAGE" => "true", "TEST_PROGRESS_DIR" => progress_dir,
-                                   "SPEC_OPTS" => "--require #{TEST_PROGRESS_LISTENER.shellescape}")
+                                   "SPEC_OPTS" => spec_opts)
       started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       progress = lambda do
         elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
