@@ -148,6 +148,21 @@ file in the repo being checked and prints a one-line summary. Checks whose
 tool or config is absent report SKIP rather than failing; only FAIL blocks. Companion `*_fix` tasks
 (`rubocop_fix`, `typos_fix`) auto-correct what their checks flag.
 
+**Which directories are scanned.** Flog, Flay, Reek and Fasterer look at
+the directories in `@@quality_dirs`, `lib` by default. A repo whose source
+lives elsewhere (a Rails app's `app/`) sets it in its own `.loki`, inside
+`class Tasks` (a class variable can't be assigned at the top level of a
+`.loki`):
+
+```ruby
+class Tasks
+  @@quality_dirs = %w[app lib].freeze
+end
+```
+
+Directories that don't exist are left out; when none of them exists, those
+four gates report SKIP with a hint to set `@@quality_dirs`.
+
 Reek fails only on files that are new to, or worse than, the per-file smell
 counts grandfathered in `.quality/reek_baseline.txt`. Its companion task,
 `reek_baseline`, regenerates that file from the current smells: run
