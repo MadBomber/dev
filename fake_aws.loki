@@ -21,8 +21,10 @@ class FakeAwsCommands < Tasks
   IMAGE       = "aws-emulator"
   MEMORY      = "2g"
 
+  # A bad AWS_EMULATOR_PORT leaves the default nil instead of raising here,
+  # at import, which would break every asgard task; `port` aborts on it.
   class_option :port, aliases: "-p", type: :numeric,
-               default: Integer(ENV.fetch("AWS_EMULATOR_PORT", "9297")),
+               default: Integer(ENV.fetch("AWS_EMULATOR_PORT", "9297"), exception: false),
                desc: "Emulator port (host and container); env AWS_EMULATOR_PORT"
 
   desc "build", "Build the emulator image for this machine's CPU"
@@ -101,7 +103,9 @@ class FakeAwsCommands < Tasks
   end
 
   no_commands do
-    def port = options[:port]
+    def port
+      options[:port] or abort "AWS_EMULATOR_PORT=#{ENV["AWS_EMULATOR_PORT"].inspect} is not a port number; fix it or pass --port"
+    end
 
     def port_flag(port = self.port) = port == 9297 ? "" : " -p #{port}"
 
