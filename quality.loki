@@ -26,10 +26,14 @@ require "shellwords"
 require "stringio"
 
 class Tasks
-  # Directories the structural gates (flog / flay / reek / fasterer) scan.
+  # Directories the structural gates (flog / flay / reek / fasterer) scan;
+  # those that don't exist are left out, and the gates SKIP when none does.
   # Gems keep the lib/ default; a component whose source lives elsewhere
-  # (e.g. a Rails app's app/) overrides this in its own .loki with a plain
-  # assignment: @@quality_dirs = %w[app lib].freeze
+  # (e.g. a Rails app's app/) overrides this in its own .loki, inside the
+  # class (a class variable can't be set at the top level of a .loki):
+  #   class Tasks
+  #     @@quality_dirs = %w[app lib].freeze
+  #   end
   @@quality_dirs ||= %w[lib].freeze
 
   # A gate whose tool blows up (a gem that no longer activates against the
@@ -39,23 +43,26 @@ class Tasks
   # task is written to that gate's _output.txt, exception and backtrace, and
   # the gate reports GATE_CRASH_STATUS. That is :fail — a gate that could
   # not run has not passed, and a WARN would let a broken gate through
-  # silently (the same reasoning as quality_check_status). Prepended on
-  # invoke_command, not defined in the class: asgard 0.6.0 refuses a task or
-  # helper of that name. SystemExit and Interrupt pass through: `abort` and
-  # Ctrl-C keep their meaning.
+  # silently (the same reasoning as quality_check_status). Other tasks, and
+  # a mistyped task name (even one ending in _check), raise as usual.
+  # Prepended on invoke_command, not defined in the class: asgard 0.6.0
+  # refuses a task or helper of that name. SystemExit and Interrupt pass
+  # through: `abort` and Ctrl-C keep their meaning.
   GATE_CRASH_STATUS = :fail
 
   module GateGuard
     def invoke_command(command, *)
-      return super unless command.name.end_with?("_check")
+      return super unless self.class.quality_checks.include?(command.name.to_sym)
 
-      super
-    rescue StandardError, ScriptError => e
-      gate   = command.name.delete_suffix("_check")
-      output = "#{gate}_output.txt"
-      File.write(output, gate_crash_text(quality_gate_label(command.name), e))
-      finish_gate(gate.to_sym, quality_gate_label(command.name), GATE_CRASH_STATUS,
-                  "could not run: #{e.class}: #{e.message.lines.first.to_s.strip} (see #{output})")
+      begin
+        super
+      rescue StandardError, ScriptError => e
+        gate   = command.name.delete_suffix("_check")
+        output = "#{gate}_output.txt"
+        File.write(output, gate_crash_text(quality_gate_label(command.name), e))
+        finish_gate(gate.to_sym, quality_gate_label(command.name), GATE_CRASH_STATUS,
+                    "could not run: #{e.class}: #{e.message.lines.first.to_s.strip} (see #{output})")
+      end
     end
   end
   prepend GateGuard
@@ -162,6 +169,8 @@ class Tasks
   # the other raised Gem::ConflictError. A subprocess lets the project's bundle
   # (or the global flog when the project does not bundle it) pick its own prism.
   def flog_check
+    return skip_gate(:flog, "Flog Complexity", no_quality_dirs_hint) if quality_dirs.empty?
+
     flog =
       if bundled_gem?("flog")
         "bundle exec flog"
@@ -170,7 +179,7 @@ class Tasks
       else
         return skip_gate(:flog, "Flog Complexity", "flog not found in the bundle or on PATH. Install it with `gem install flog`.")
       end
-    output, status = Open3.capture2e(project_ruby_env, "#{flog} --all --methods-only --quiet #{@@quality_dirs.join(' ')}")
+    output, status = Open3.capture2e(project_ruby_env, "#{flog} --all --methods-only --quiet #{quality_dirs.shelljoin}")
     return report_gate(:flog, "Flog Complexity", output, :fail, ->(*) { "failed to run" }) unless status.success?
 
     warnings, failures = flog_findings(output)
@@ -186,6 +195,7 @@ class Tasks
 
   desc "Check for structural code duplication with Flay (mass >= 150)"
   def flay_check
+    return skip_gate(:flay, "Flay Duplication", no_quality_dirs_hint) if quality_dirs.empty?
     return skip_gate(:flay, "Flay Duplication", in_process_gem_hint("flay")) unless gem_loadable?("flay")
     require "flay" # no-op once loaded; keeps Flay below independent of the guard
 
@@ -209,6 +219,7 @@ class Tasks
 
   desc "Check code smells with Reek (fails only on new/worsened files vs .quality/reek_baseline.txt)"
   def reek_check
+    return skip_gate(:reek, "Reek Smells", no_quality_dirs_hint) if quality_dirs.empty?
     return skip_gate(:reek, "Reek Smells", in_process_gem_hint("reek")) unless gem_loadable?("reek")
 
     config = reek_configuration
@@ -285,9 +296,10 @@ class Tasks
 
   desc "Check for performance suggestions with Fasterer"
   def fasterer_check
+    return skip_gate(:fasterer, "Fasterer", no_quality_dirs_hint) if quality_dirs.empty?
     return skip_gate(:fasterer, "Fasterer", not_bundled_hint("fasterer")) unless bundled_gem?("fasterer")
 
-    run_gate(:fasterer, "Fasterer", "bundle exec fasterer #{@@quality_dirs.join(' ')}",
+    run_gate(:fasterer, "Fasterer", "bundle exec fasterer #{quality_dirs.shelljoin}",
              summary: /files? inspected/, on_fail: :warn)
   end
 
@@ -367,9 +379,19 @@ class Tasks
   }.freeze
 
   no_commands do
-    # Ruby files under the configured @@quality_dirs.
+    # The configured @@quality_dirs that exist here. A missing one is left
+    # out: flog given only missing paths falls back to scanning ".".
+    def quality_dirs = @@quality_dirs.select { File.directory?(it) }
+
+    # Skip reason for the structural gates when none of @@quality_dirs exists.
+    def no_quality_dirs_hint
+      "none of @@quality_dirs (#{@@quality_dirs.join(", ")}) exists here. Set it in this repo's .loki " \
+        "inside `class Tasks ... end`, e.g. `@@quality_dirs = %w[app lib].freeze`."
+    end
+
+    # Ruby files under the existing @@quality_dirs.
     def quality_source_files
-      @@quality_dirs.flat_map { |dir| Dir.glob("#{dir}/**/*.rb") }
+      quality_dirs.flat_map { |dir| Dir.glob("#{dir}/**/*.rb") }
     end
 
     # Pure: which runner test_check uses, from what the repo has.
@@ -406,8 +428,9 @@ class Tasks
       FileUtils.rm_rf(progress_dir)
       FileUtils.mkdir_p(progress_dir)
       processes = parallel_test_processes
+      spec_opts = [ENV["SPEC_OPTS"], "--require #{TEST_PROGRESS_LISTENER.shellescape}"].compact.join(" ")
       env = project_ruby_env.merge("COVERAGE" => "true", "TEST_PROGRESS_DIR" => progress_dir,
-                                   "SPEC_OPTS" => "--require #{TEST_PROGRESS_LISTENER.shellescape}")
+                                   "SPEC_OPTS" => spec_opts)
       started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       progress = lambda do
         elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started

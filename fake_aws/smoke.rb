@@ -5,10 +5,13 @@ require "aws-sdk-s3"
 require "aws-sdk-sqs"
 require "json"
 
+FAILED = []
+
 def check(label)
   result = yield
   printf "  %-38s ok  %s\n", label, result
 rescue => e
+  FAILED << label
   printf "  %-38s FAIL %s: %s\n", label, e.class, e.message
 end
 
@@ -90,3 +93,6 @@ check("FIFO queue ordering") do
   bodies.inspect
 end
 check("delete_queue")       { sqs.delete_queue(queue_url: q); "ok" }
+
+print "\n#{FAILED.empty? ? "All checks passed" : "#{FAILED.size} check(s) failed: #{FAILED.join(', ')}"}\n"
+exit(FAILED.empty? ? 0 : 1)

@@ -120,7 +120,8 @@ dependency. `@@gem_name` defaults to the gemspec's basename (falling back to
 the directory name); a repo may set it earlier if it differs. A `gem_version`
 helper takes the version from the gemspec, falling back to a string `VERSION`
 in `lib/<gem_name>/version.rb` (dashes become slashes), then in the first
-`lib/**/version.rb` that defines it.
+`lib/**/version.rb` that defines it. It imports `quality.loki` itself, since
+`build` runs the gate, so it can be imported alone.
 
 - `build` — runs the `quality` gate, then builds the gemspec into
   `pkg/<name>-<version>.gem`; aborts if no version can be determined
@@ -147,6 +148,21 @@ file in the repo being checked and prints a one-line summary. Checks whose
 tool or config is absent report SKIP rather than failing; only FAIL blocks. Companion `*_fix` tasks
 (`rubocop_fix`, `typos_fix`) auto-correct what their checks flag.
 
+**Which directories are scanned.** Flog, Flay, Reek and Fasterer look at
+the directories in `@@quality_dirs`, `lib` by default. A repo whose source
+lives elsewhere (a Rails app's `app/`) sets it in its own `.loki`, inside
+`class Tasks` (a class variable can't be assigned at the top level of a
+`.loki`):
+
+```ruby
+class Tasks
+  @@quality_dirs = %w[app lib].freeze
+end
+```
+
+Directories that don't exist are left out; when none of them exists, those
+four gates report SKIP with a hint to set `@@quality_dirs`.
+
 Reek fails only on files that are new to, or worse than, the per-file smell
 counts grandfathered in `.quality/reek_baseline.txt`. Its companion task,
 `reek_baseline`, regenerates that file from the current smells: run
@@ -166,7 +182,8 @@ RSpec runs set `COVERAGE=true`. The parallel run uses
 `PARALLEL_TEST_PROCESSORS` processes (default: CPU count, at most 8, never
 more than there are spec files) and, on the live board, shows a progress
 bar fed by `quality/test_progress_listener.rb`, which is loaded through
-`SPEC_OPTS` so the app carries no code for it. A Rails app needs its
+`SPEC_OPTS` (appended to any `SPEC_OPTS` you set) so the app carries no
+code for it. A Rails app needs its
 per-process test databases first: `bin/rails parallel:prepare`.
 
 **A gate that raises is a FAIL, not a crash.** An exception out of any
@@ -225,7 +242,8 @@ be redeclared.
 `git_collect` and `github_collect` cover the repo at `RR` by default. For a
 project whose work is spread over several clones, list the others in
 `STATUS_REPO_DIRS`, separated by `:` (relative paths are resolved against
-`RR`); each repo then gets its own heading in the day's file:
+`RR`); each repo then gets its own heading in the day's file (its directory
+name, or `parent/name` when two repos share a name):
 
 ```bash
 export STATUS_REPO_DIRS="branches/working:../shared-library"
@@ -357,7 +375,8 @@ A discovery layer over a repo's operational runbooks, the Markdown files
 in `docs/runbooks` (`README.md` is left out). `asgard runbook list` prints
 each file's name and its first heading; `asgard runbook show NAME` opens
 the one whose name contains NAME (case-insensitive, `-` and `_` treated
-alike) in `glow` when installed, else `$PAGER`, else `less`. Off a terminal
+alike, a trailing `.md` ignored; an exact name wins) in `glow` when
+installed, else `$PAGER`, else `less`. Off a terminal
 it prints the file instead. Set `RUNBOOKS_DIR` when the runbooks live
 somewhere else.
 

@@ -98,7 +98,6 @@
 # prints Jira's own errors when it does, and `ready` sets the usual ones.
 # The browser tasks call macOS `open`.
 
-require "base64"
 require "fileutils"
 require "json"
 require "net/http"
@@ -411,8 +410,10 @@ class TicketCommands < Tasks
   end
 
   # Header + rows → markdown table lines, columns padded so the source
-  # also reads aligned.
+  # also reads aligned. "|" in a cell is escaped so free text such as a
+  # title stays in its cell instead of splitting the row.
   helper(:jira_markdown_table) do |header, rows|
+    header, *rows = ([header] + rows).map { |row| row.map { it.to_s.gsub("|", "\\|") } }
     widths = ([header] + rows).transpose.map { |col| col.map(&:length).max }
     line = ->(cells) { "| #{cells.each_with_index.map { |c, i| c.ljust(widths[i]) }.join(" | ")} |" }
     [line.call(header), "|#{widths.map { "-" * (it + 2) }.join("|")}|", *rows.map { line.call(it) }]
@@ -1008,7 +1009,8 @@ class TicketCommands < Tasks
     last = options[:since] ? Time.iso8601(options[:since]) : jira_sync_last(stamp)
     abort "No #{stamp}; run once with --since (e.g. --since #{(started - 3600).iso8601})." unless last
 
-    changed = jira_ffind_fetch([], jql: jira_sync_jql(last, started))
+    # No cap: the stamp below moves past every change, so each must be fetched.
+    changed = jira_ffind_fetch([], Float::INFINITY, jql: jira_sync_jql(last, started))
     puts "#{started.strftime("%F %T")} sync: #{changed.size} ticket(s) changed since #{last.strftime("%F %T")}" \
          "#{": #{changed.map { it["key"] }.join(" ")}" unless changed.empty?}"
     return if options[:dry_run]

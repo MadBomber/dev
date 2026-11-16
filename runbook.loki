@@ -5,7 +5,7 @@
 # memorable command away.
 #
 #   asgard runbook list          — list the runbooks with their titles
-#   asgard runbook show NAME     — read one by (partial) name
+#   asgard runbook show NAME     — read one by (partial) name; an exact name wins
 #
 # Runbooks are the Markdown files in docs/runbooks (README.md is left out).
 # A repo that keeps them elsewhere sets RUNBOOKS_DIR, or assigns
@@ -28,10 +28,16 @@ class RunbookCommands < Tasks
   end
 
   # Pure: the +files+ whose name contains +name+: a case-insensitive
-  # substring match over the filename, with - and _ treated as equal.
+  # substring match over the filename, with - and _ treated as equal and a
+  # trailing .md ignored. A file whose whole name equals +name+ wins alone,
+  # so a runbook whose name is part of another's can still be opened.
   helper(:runbook_matches) do |name, files = runbook_files|
-    needle = name.to_s.downcase.tr("_", "-")
-    files.select { |f| File.basename(f, ".md").downcase.tr("_", "-").include?(needle) }
+    normalize = ->(s) { s.downcase.tr("_", "-") }
+    needle = normalize.(name.to_s).delete_suffix(".md")
+    exact = files.select { |f| normalize.(File.basename(f, ".md")) == needle }
+    next exact unless exact.empty?
+
+    files.select { |f| normalize.(File.basename(f, ".md")).include?(needle) }
   end
 
   # argv of the pager for +file+: glow when installed, else $PAGER, else less.

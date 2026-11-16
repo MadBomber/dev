@@ -15,21 +15,24 @@
 # Each port gets its own container (aws-emulator-<port>), so several can run at once.
 
 require "fileutils"
+require "shellwords"
 
 class FakeAwsCommands < Tasks
   SUPPORT_DIR = File.join(__dir__, "fake_aws").freeze
   IMAGE       = "aws-emulator"
   MEMORY      = "2g"
 
+  # A bad AWS_EMULATOR_PORT leaves the default nil instead of raising here,
+  # at import, which would break every asgard task; `port` aborts on it.
   class_option :port, aliases: "-p", type: :numeric,
-               default: Integer(ENV.fetch("AWS_EMULATOR_PORT", "9297")),
+               default: Integer(ENV.fetch("AWS_EMULATOR_PORT", "9297"), exception: false),
                desc: "Emulator port (host and container); env AWS_EMULATOR_PORT"
 
   desc "build", "Build the emulator image for this machine's CPU"
   method_option :fresh, type: :boolean, desc: "Ignore the cache and download the latest LTS package"
   def build
     flags = options[:fresh] ? "--pull --no-cache " : ""
-    sh "docker build #{flags}--build-arg ARCH=#{rpm_arch} -t #{IMAGE} #{SUPPORT_DIR}"
+    sh "docker build #{flags}--build-arg ARCH=#{rpm_arch} -t #{IMAGE} #{SUPPORT_DIR.shellescape}"
   end
 
   desc "start", "Start the emulator (telemetry off) and wait until it is healthy"
@@ -90,7 +93,7 @@ class FakeAwsCommands < Tasks
 
     sh <<~SHELL
       #{export_lines(port).join("\n")}
-      ruby #{File.join(SUPPORT_DIR, 'smoke.rb')}
+      ruby #{File.join(SUPPORT_DIR, 'smoke.rb').shellescape}
     SHELL
   end
 
@@ -101,7 +104,9 @@ class FakeAwsCommands < Tasks
   end
 
   no_commands do
-    def port = options[:port]
+    def port
+      options[:port] or abort "AWS_EMULATOR_PORT=#{ENV["AWS_EMULATOR_PORT"].inspect} is not a port number; fix it or pass --port"
+    end
 
     def port_flag(port = self.port) = port == 9297 ? "" : " -p #{port}"
 
@@ -125,24 +130,25 @@ class FakeAwsCommands < Tasks
 
     # Same port on both sides: the emulator writes its port into the files it creates.
     # Published on 127.0.0.1 only so other machines can't reach it.
+    # Shell-quoted, so a home directory with spaces stays one argument.
     def docker_run_command(port:, auth: true, idle_timeout: nil)
-      emulator_args = ["-p #{port}", "--telemetry off"]
-      emulator_args << "--auth off" unless auth
-      emulator_args << "--idle-timeout #{idle_timeout}" if idle_timeout
+      emulator_args = ["-p", port, "--telemetry", "off"]
+      emulator_args += ["--auth", "off"] unless auth
+      emulator_args += ["--idle-timeout", idle_timeout] if idle_timeout
 
-      <<~CMD.split.join(" ")
-        docker run -d --rm --name #{container(port)}
-          --memory=#{MEMORY} --memory-swap=#{MEMORY}
-          -p 127.0.0.1:#{port}:#{port}
-          -e HOME=#{Dir.home} -v #{emulator_home}:#{emulator_home}
-          #{IMAGE} #{emulator_args.join(' ')}
-      CMD
+      [
+        "docker", "run", "-d", "--rm", "--name", container(port),
+        "--memory=#{MEMORY}", "--memory-swap=#{MEMORY}",
+        "-p", "127.0.0.1:#{port}:#{port}",
+        "-e", "HOME=#{Dir.home}", "-v", "#{emulator_home}:#{emulator_home}",
+        IMAGE, *emulator_args
+      ].map(&:to_s).shelljoin
     end
 
     def healthy?(port = self.port)
       ca = File.join(port_dir(port), "ca.pem")
       File.exist?(ca) &&
-        system("curl -sf --cacert #{ca} #{endpoint_url(port)}/__admin/health >/dev/null 2>&1")
+        system("curl", "-sf", "--cacert", ca, "#{endpoint_url(port)}/__admin/health", out: File::NULL, err: File::NULL)
     end
 
     def wait_until_healthy(port = self.port, tries: 30)
@@ -155,14 +161,15 @@ class FakeAwsCommands < Tasks
     end
 
     # The variables the AWS docs list, plus unsets so real credentials can't leak in.
+    # Shell-quoted for eval "$(asgard fake_aws exports)".
     def export_lines(port = self.port)
       dir = port_dir(port)
       [
         "unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE",
         "export AWS_ENDPOINT_URL=#{endpoint_url(port)}",
-        "export AWS_SHARED_CREDENTIALS_FILE=#{dir}/emulator_credentials",
-        "export AWS_CONFIG_FILE=#{dir}/config",
-        "export AWS_CA_BUNDLE=#{dir}/ca.pem",
+        "export AWS_SHARED_CREDENTIALS_FILE=#{File.join(dir, "emulator_credentials").shellescape}",
+        "export AWS_CONFIG_FILE=#{File.join(dir, "config").shellescape}",
+        "export AWS_CA_BUNDLE=#{File.join(dir, "ca.pem").shellescape}",
         "export AWS_EC2_METADATA_DISABLED=true",
         "export AWS_DISABLE_HOST_PREFIX_INJECTION=true",
         "export AWS_REGION=us-east-1",

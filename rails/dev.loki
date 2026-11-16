@@ -33,11 +33,17 @@ class DevCommands < Tasks
   helper(:mailpit_installed?) { system("which", "mailpit", out: File::NULL, err: File::NULL) }
 
   # Pid from a pid file, nil (and the stale file cleaned up) when that
-  # process is no longer alive.
+  # process is no longer alive or the file holds no usable pid (empty or
+  # garbled reads as 0, which Process.kill takes as our own process group).
   helper(:live_pid_from) do |pid_file|
     next nil unless File.exist?(pid_file)
 
     pid = File.read(pid_file).to_i
+    unless pid.positive?
+      File.delete(pid_file)
+      next nil
+    end
+
     begin
       Process.kill(0, pid)
       pid
