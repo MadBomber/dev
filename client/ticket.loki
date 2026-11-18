@@ -839,11 +839,13 @@ class TicketCommands < Tasks
   end
 
   # argv for jira-cli to create a ticket of an exact type name. Epics go
-  # through `epic create` without -n: jira-cli would put -n in the legacy
-  # Epic Name field, which a project's Epic create screen may not have.
-  # `issue create --raw` prints JSON; `epic create` only prints the URL.
+  # through `epic create`, which with --no-input refuses to run without -n
+  # (the Epic Name); the summary serves. jira-cli sends -n only for company-
+  # managed projects (to the epic.name field from `jira init`), never for
+  # team-managed ones. `issue create --raw` prints JSON; `epic create` only
+  # prints the URL.
   helper(:jira_create_args) do |type, summary, parent: nil, description: nil, assignee: nil|
-    args = type == "Epic" ? %w[epic create] : ["issue", "create", "-t", type, "--raw"]
+    args = type == "Epic" ? ["epic", "create", "-n", summary] : ["issue", "create", "-t", type, "--raw"]
     args += ["-s", summary, "--no-input"]
     args += ["-P", parent] if parent
     args += ["-b", description] if description
