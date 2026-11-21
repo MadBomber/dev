@@ -2,14 +2,38 @@
 # MadBomber-level per-repo git tasks. These run in ONE repo's context. A
 # component may override any of them in its own .loki (e.g. aia's `push` also
 # pushes tags), and the project-level cross-repo dispatchers will honor it.
+#
+# Also provides git helpers (no_commands) that a repo composes into its own
+# tasks, e.g. lamplight.guide's `asgard release` in tags.loki. Import with:
+#
+#   import_up "dev/git.loki"
 
 class Tasks
   desc "Push the current branch to its remote"
-  def push = sh "git push"
+  def push = git_push(Dir.pwd)
 
   desc "Pull (fast-forward only) from the remote"
   def pull = sh "git pull --ff-only"
 
   desc "Fetch from the remote"
   def fetch = sh "git fetch"
+
+  no_commands do
+    # True when git sees any change -- tracked or untracked -- under the paths.
+    def git_changed?(root, *paths)
+      scope = paths.empty? ? "" : " -- #{paths.join(' ')}"
+      !`git -C #{root} status --porcelain#{scope}`.empty?
+    end
+
+    # Stage and commit only the named paths. Anything else the user has
+    # staged stays staged and never rides along in this commit.
+    def git_commit_scoped(root, message, *paths)
+      sh "git -C #{root} add -- #{paths.join(' ')}"
+      sh "git -C #{root} commit -m '#{message}' -- #{paths.join(' ')}"
+    end
+
+    def git_push(root)
+      sh "git -C #{root} push"
+    end
+  end
 end

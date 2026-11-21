@@ -100,7 +100,7 @@ whose `push` also pushes tags).
 | `gem_tasks.loki` | Gem lifecycle: `console`, `build`, `install`, `release` |
 | `quality.loki` | The `quality` gate and the `*_check` tasks it runs (`quality/` holds its RSpec progress listener) |
 | `rails/quality_rails.loki` | Rails-only checks: Brakeman, RailsBestPractices, ActiveRecordDoctor |
-| `git.loki` | Per-repo git basics: `push`, `pull` (ff-only), `fetch` |
+| `git.loki` | Per-repo git basics: `push`, `pull` (ff-only), `fetch`; plus helpers `git_changed?`, `git_commit_scoped`, `git_push` for composing repo tasks |
 | `doc_tasks.loki` | Documentation site tasks, for a repo with `mkdocs.yml` or `bridgetown.config.yml`: `doc install`, `doc build`, `doc serve`, `doc open` |
 | `client/status_report.loki` | End-of-week client status reporting: `daily_summary`, `weekly_report`, `shell_hourly` |
 | `client/ticket.loki` | Jira tickets from the command line: `asgard ticket show`, `mine`, `search`, `ffind`, `move`, `comment`, `history`, `ready`, `children`, `remaining`, `link`, `attach`, `detach`, `create`, `sync`, `branch`, `pr`, and more |
