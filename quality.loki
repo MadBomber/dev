@@ -362,6 +362,20 @@ class Tasks
     run_gate(:archspec, "ArchSpec", "archspec check", summary: /architecture violations? found|ArchSpec passed/i)
   end
 
+  # Advisory: `exhale dry` exits non-zero while the codebase holds
+  # duplication its Contract doesn't keep, which is a contraction to weigh,
+  # not a failure of the change under review, so findings report :warn.
+  # Its first output line ("exhale dry: N introduced, ...") is the summary.
+  desc "Check for duplication the Contract doesn't keep with exhale (advisory)"
+  def exhale_check
+    unless command_available?("exhale")
+      return skip_gate(:exhale, "Exhale", "`exhale` command not found. Install it with `gem install exhale`.")
+    end
+
+    run_gate(:exhale, "Exhale", "exhale dry", on_fail: :warn,
+             summary: ->(output, result) { output[/\Aexhale dry: (.+?)\s*$/, 1] || result.to_s })
+  end
+
   # Curated display labels for the *_check tasks defined in this file. A
   # *_check task from elsewhere (e.g. rails/quality_rails.loki's brakeman_check,
   # when a Rails project imports that file) isn't listed here — it just
@@ -375,6 +389,7 @@ class Tasks
     "erb_lint_check" => "ERBLint",
     "scrap_check"    => "SCRAP Test Structure",
     "archspec_check" => "ArchSpec",
+    "exhale_check"   => "Exhale",
     "ard_check"      => "ActiveRecordDoctor", # rails/quality_rails.loki; the fallback would read "Ard"
   }.freeze
 
@@ -592,9 +607,16 @@ class Tasks
 
     # +note+ cut to fit on one terminal line after +pattern+'s visible text.
     # A wrapped row would throw off the board's cursor moves.
-    def fit_note(note, pattern, columns = $stdout.winsize[1].nonzero? || 80)
+    def fit_note(note, pattern, columns = terminal_columns)
       room = columns - pattern.sub(":spinner:badge", "PASS").sub(":note", "").length - 1
       note.length <= room ? note : "#{note[0, [room - 1, 0].max]}…"
+    end
+
+    # The terminal's width in columns, or 80 when there is none. Asks the
+    # terminal (IO.console), not $stdout: in-process gates such as Reek
+    # swap $stdout for a StringIO while they run, which has no winsize.
+    def terminal_columns(console = IO.console)
+      console&.winsize&.last.to_i.nonzero? || 80
     end
 
     # The colored badge text for a status, e.g. PASS in green.

@@ -86,6 +86,7 @@ whose `push` also pushes tags).
   | `mkdocs` | `doc` tasks in a MkDocs repo | `asgard doc install` (Homebrew) |
   | `typos` | `typos_check`, `typos_fix` | `brew install typos-cli` |
   | `archspec` | `archspec_check` (also needs an `Archspec.rb`) | `gem install archspec`, then `archspec init` |
+  | `exhale` | `exhale_check` (advisory) | `gem install exhale` |
 
 - **macOS assumptions.** `doc open` and `db_doc_open` call macOS `open`,
   `doc install` installs mkdocs with Homebrew, and `calendar_collect` reads
